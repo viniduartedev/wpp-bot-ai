@@ -1,0 +1,22 @@
+{
+  "name": "wpp-bot-ai",
+  "version": "1.0.0",
+  "description": "Bot de WhatsApp simples com Twilio Sandbox para aprendizado",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "twilio",
+    "whatsapp",
+    "bot",
+    "express"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "twilio": "^5.4.0"
+  }
+}
