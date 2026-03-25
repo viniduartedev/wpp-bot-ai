@@ -1,13 +1,15 @@
 const { parse: parseQueryString } = require('node:querystring');
 const twilio = require('twilio');
-const { saveAppointmentRequest } = require('../lib/appointment-requests');
+const {
+  logAppointmentRegistrationFailure,
+  registerAppointmentServiceRequest,
+} = require('../lib/core/intake');
 
 const SESSION_STEPS = {
   MENU: 'menu',
   AWAITING_NAME: 'awaiting_name',
   AWAITING_DATE: 'awaiting_date',
   AWAITING_TIME: 'awaiting_time',
-  CONFIRMED: 'confirmed',
 };
 
 // Controle simples de estado em memoria por numero de telefone.
@@ -16,8 +18,10 @@ const SESSION_STEPS = {
 // Em producao isso nao e confiavel em serverless, porque a memoria pode
 // ser perdida entre invocacoes. O ideal no futuro e usar banco de dados
 // ou um cache externo para persistir o estado da conversa.
-// Neste MVP, o Firestore entra para persistir apenas a solicitacao final
-// de agendamento, que depois pode ser lida pelo painel em outro projeto.
+// Nesta etapa, o bot passa a registrar a entrada oficial no core via
+// contacts + serviceRequests, com inboundEvents para observabilidade.
+// No futuro, o mesmo canal WhatsApp tambem podera ser usado em saida
+// para confirmacoes, lembretes e outros eventos disparados pelo core.
 const sessions = {};
 
 function getMainMenu() {
@@ -116,6 +120,18 @@ function resetSession(from) {
   return sessions[from];
 }
 
+function closeSession(from) {
+  const previousStep = sessions[from] ? sessions[from].step : null;
+
+  delete sessions[from];
+
+  console.log('[session] Sessão finalizada:', {
+    from,
+    de: previousStep,
+    para: null,
+  });
+}
+
 function buildConfirmationMessage(session) {
   return `Agendamento solicitado com sucesso ✅
 
@@ -125,7 +141,7 @@ Horário: ${session.data.time}
 
 Em breve entraremos em contato para confirmar.
 
-Digite menu para voltar ao início.`;
+Se quiser, digite menu para ver as opções novamente.`;
 }
 
 async function handleSchedulingFlow(from, messageText) {
@@ -149,30 +165,39 @@ Qual dia você deseja? Exemplo: 25/03`;
     session.data.time = cleanedMessage;
 
     try {
-      console.log('[firestore] Iniciando persistencia da solicitacao:', {
+      console.log('[core] Iniciando persistencia oficial do agendamento:', {
         phone: from,
-        customerName: session.data.name,
+        name: session.data.name,
         requestedDate: session.data.date,
         requestedTime: session.data.time,
       });
 
-      const savedRequest = await saveAppointmentRequest({
+      const registrationResult = await registerAppointmentServiceRequest({
         phone: from,
-        customerName: session.data.name,
+        name: session.data.name,
         requestedDate: session.data.date,
         requestedTime: session.data.time,
       });
 
-      console.log('[firestore] Solicitacao salva com sucesso:', {
-        id: savedRequest.id,
+      console.log('[core] Persistencia oficial concluida:', {
+        projectId: registrationResult.project.id,
+        contactId: registrationResult.contact.id,
+        serviceRequestId: registrationResult.serviceRequest.id,
         phone: from,
       });
 
-      setSessionStep(from, SESSION_STEPS.CONFIRMED);
-      return buildConfirmationMessage(session);
+      const confirmationMessage = buildConfirmationMessage(session);
+      closeSession(from);
+
+      return confirmationMessage;
     } catch (error) {
-      console.error('[firestore] Erro ao salvar solicitacao:', error);
-      return 'Houve um problema ao registrar seu agendamento. Tente novamente em instantes.';
+      console.error('[core] Erro ao registrar atendimento no core oficial:', error);
+      await logAppointmentRegistrationFailure({
+        phone: from,
+        projectId: error.projectId || null,
+        error,
+      });
+      return 'Houve um problema ao registrar seu atendimento. Tente novamente em instantes.';
     }
   }
 
@@ -224,10 +249,6 @@ async function montarRespostaBot(from, mensagemTexto) {
     resetSession(from);
     setSessionStep(from, SESSION_STEPS.AWAITING_NAME);
     return 'Perfeito! Vamos iniciar seu agendamento.\n\nQual é o seu nome?';
-  }
-
-  if (currentSession && currentSession.step === SESSION_STEPS.CONFIRMED) {
-    return 'Seu agendamento já foi registrado. Digite menu para voltar ao início.';
   }
 
   return "Não entendi sua mensagem. Digite 'menu' para ver as opções.";
