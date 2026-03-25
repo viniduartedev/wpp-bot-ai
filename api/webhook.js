@@ -1,5 +1,6 @@
 const { parse: parseQueryString } = require('node:querystring');
 const twilio = require('twilio');
+const { saveAppointmentRequest } = require('../lib/appointment-requests');
 
 const SESSION_STEPS = {
   MENU: 'menu',
@@ -15,6 +16,8 @@ const SESSION_STEPS = {
 // Em producao isso nao e confiavel em serverless, porque a memoria pode
 // ser perdida entre invocacoes. O ideal no futuro e usar banco de dados
 // ou um cache externo para persistir o estado da conversa.
+// Neste MVP, o Firestore entra para persistir apenas a solicitacao final
+// de agendamento, que depois pode ser lida pelo painel em outro projeto.
 const sessions = {};
 
 function getMainMenu() {
@@ -125,7 +128,7 @@ Em breve entraremos em contato para confirmar.
 Digite menu para voltar ao início.`;
 }
 
-function handleSchedulingFlow(from, messageText) {
+async function handleSchedulingFlow(from, messageText) {
   const session = ensureSession(from);
   const cleanedMessage = String(messageText || '').trim();
 
@@ -144,8 +147,33 @@ Qual dia você deseja? Exemplo: 25/03`;
 
   if (session.step === SESSION_STEPS.AWAITING_TIME) {
     session.data.time = cleanedMessage;
-    setSessionStep(from, SESSION_STEPS.CONFIRMED);
-    return buildConfirmationMessage(session);
+
+    try {
+      console.log('[firestore] Iniciando persistencia da solicitacao:', {
+        phone: from,
+        customerName: session.data.name,
+        requestedDate: session.data.date,
+        requestedTime: session.data.time,
+      });
+
+      const savedRequest = await saveAppointmentRequest({
+        phone: from,
+        customerName: session.data.name,
+        requestedDate: session.data.date,
+        requestedTime: session.data.time,
+      });
+
+      console.log('[firestore] Solicitacao salva com sucesso:', {
+        id: savedRequest.id,
+        phone: from,
+      });
+
+      setSessionStep(from, SESSION_STEPS.CONFIRMED);
+      return buildConfirmationMessage(session);
+    } catch (error) {
+      console.error('[firestore] Erro ao salvar solicitacao:', error);
+      return 'Houve um problema ao registrar seu agendamento. Tente novamente em instantes.';
+    }
   }
 
   return null;
@@ -167,7 +195,7 @@ function normalizarBody(req) {
   return {};
 }
 
-function montarRespostaBot(from, mensagemTexto) {
+async function montarRespostaBot(from, mensagemTexto) {
   const textoNormalizado = normalizeMessage(mensagemTexto);
   const currentSession = sessions[from];
 
@@ -205,7 +233,7 @@ function montarRespostaBot(from, mensagemTexto) {
   return "Não entendi sua mensagem. Digite 'menu' para ver as opções.";
 }
 
-module.exports = function handler(req, res) {
+module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
     return res.status(405).send('Method Not Allowed');
@@ -226,7 +254,7 @@ module.exports = function handler(req, res) {
   // TwiML e o XML que a Twilio entende como instrucao de resposta.
   // Aqui usamos a biblioteca oficial para montar a resposta do WhatsApp.
   const twiml = new twilio.twiml.MessagingResponse();
-  twiml.message(montarRespostaBot(from, mensagemRecebida));
+  twiml.message(await montarRespostaBot(from, mensagemRecebida));
 
   res.setHeader('Content-Type', 'text/xml');
   return res.status(200).send(twiml.toString());
