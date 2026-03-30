@@ -55,15 +55,61 @@ function createInitialSession() {
 }
 
 function normalizeMessage(message) {
-  return String(message || '').trim().toLowerCase();
+  return String(message || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ');
 }
 
 function isGreeting(text) {
-  return ['oi', 'olá', 'ola', 'bom dia', 'boa tarde', 'boa noite'].includes(text);
+  return ['oi', 'ola', 'bom dia', 'boa tarde', 'boa noite'].includes(text);
 }
 
 function isMenuCommand(text) {
-  return ['menu', 'inicio', 'início'].includes(text);
+  return ['menu', 'inicio', 'comecar'].includes(text);
+}
+
+function isSchedulingIntent(text) {
+  return (
+    text === '1' ||
+    [
+      'agendar',
+      'agendamento',
+      'quero agendar',
+      'quero marcar',
+      'marcar consulta',
+      'marcar horario',
+      'solicitar atendimento',
+      'solicitar agendamento',
+    ].some((keyword) => text.includes(keyword))
+  );
+}
+
+function isHoursIntent(text) {
+  return (
+    text === '2' ||
+    ['horario', 'horarios', 'funcionamento', 'horario de atendimento'].some((keyword) =>
+      text.includes(keyword),
+    )
+  );
+}
+
+function isAddressIntent(text) {
+  return (
+    text === '3' ||
+    ['endereco', 'localizacao', 'onde fica'].some((keyword) => text.includes(keyword))
+  );
+}
+
+function isTalkToTeamIntent(text) {
+  return (
+    text === '4' ||
+    ['falar com a equipe', 'falar com atendente', 'atendente', 'humano'].some((keyword) =>
+      text.includes(keyword),
+    )
+  );
 }
 
 function isSchedulingStep(step) {
@@ -235,11 +281,11 @@ async function handleSchedulingFlow(from, messageText) {
   }
 
   if (session.step === SESSION_STEPS.AWAITING_CONFIRMATION) {
-    if (['1', 'confirmar', 'sim'].includes(normalizedMessage)) {
+    if (['1', 'confirmar', 'sim', 'ok'].includes(normalizedMessage)) {
       return submitAppointmentRequest(from, session);
     }
 
-    if (['2', 'corrigir'].includes(normalizedMessage)) {
+    if (['2', 'corrigir', 'editar', 'nao', 'não'].includes(normalizedMessage)) {
       return restartScheduling(from);
     }
 
@@ -269,7 +315,12 @@ async function montarRespostaBot(from, mensagemTexto) {
   const textoNormalizado = normalizeMessage(mensagemTexto);
   const currentSession = sessions[from];
 
-  if (isMenuCommand(textoNormalizado) || isGreeting(textoNormalizado)) {
+  if (isMenuCommand(textoNormalizado)) {
+    resetSession(from);
+    return getWelcomeMenuMessage();
+  }
+
+  if (isGreeting(textoNormalizado) && (!currentSession || currentSession.step === SESSION_STEPS.MENU)) {
     resetSession(from);
     return getWelcomeMenuMessage();
   }
@@ -278,19 +329,19 @@ async function montarRespostaBot(from, mensagemTexto) {
     return handleSchedulingFlow(from, mensagemTexto);
   }
 
-  if (textoNormalizado === '1') {
+  if (isSchedulingIntent(textoNormalizado)) {
     return startScheduling(from);
   }
 
-  if (textoNormalizado === '2') {
+  if (isHoursIntent(textoNormalizado)) {
     return getHoursMessage();
   }
 
-  if (textoNormalizado === '3') {
+  if (isAddressIntent(textoNormalizado)) {
     return getAddressMessage();
   }
 
-  if (textoNormalizado === '4') {
+  if (isTalkToTeamIntent(textoNormalizado)) {
     resetSession(from);
     return getTalkToTeamMessage();
   }
