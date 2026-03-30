@@ -1,6 +1,29 @@
 const { parse: parseQueryString } = require('node:querystring');
 const twilio = require('twilio');
 const {
+  getAddressMessage,
+  getConfirmationChoiceErrorMessage,
+  getConversationFallbackMessage,
+  getDatePromptMessage,
+  getDateValidationMessage,
+  getHoursMessage,
+  getNameValidationMessage,
+  getRegistrationFailureMessage,
+  getRequestConfirmationMessage,
+  getRequestRegisteredMessage,
+  getRestartSchedulingMessage,
+  getSchedulingWelcomeMessage,
+  getTalkToTeamMessage,
+  getTimePromptMessage,
+  getTimeValidationMessage,
+  getWelcomeMenuMessage,
+} = require('../lib/bot/messages');
+const {
+  normalizeDateInput,
+  normalizeNameInput,
+  normalizeTimeInput,
+} = require('../lib/bot/validation');
+const {
   logAppointmentRegistrationFailure,
   registerAppointmentServiceRequest,
 } = require('../lib/core/intake');
@@ -10,30 +33,15 @@ const SESSION_STEPS = {
   AWAITING_NAME: 'awaiting_name',
   AWAITING_DATE: 'awaiting_date',
   AWAITING_TIME: 'awaiting_time',
+  AWAITING_CONFIRMATION: 'awaiting_confirmation',
 };
 
 // Controle simples de estado em memoria por numero de telefone.
-// Isso serve para aprendizado e pode funcionar enquanto a mesma funcao
-// serverless continuar "quente" no provedor.
-// Em producao isso nao e confiavel em serverless, porque a memoria pode
-// ser perdida entre invocacoes. O ideal no futuro e usar banco de dados
-// ou um cache externo para persistir o estado da conversa.
-// Nesta etapa, o bot passa a registrar a entrada oficial no core via
-// contacts + serviceRequests, com inboundEvents para observabilidade.
-// No futuro, o mesmo canal WhatsApp tambem podera ser usado em saida
-// para confirmacoes, lembretes e outros eventos disparados pelo core.
+// Nesta etapa, o foco e deixar o happy path da demo mais convincente,
+// mantendo o bot como canal de entrada para solicitacoes.
+// A confirmacao final do agendamento continua acontecendo fora deste bot,
+// pela equipe ou pelos fluxos posteriores do ecossistema.
 const sessions = {};
-
-function getMainMenu() {
-  return `Olá! 👋
-Sou um bot de testes.
-
-Digite uma opção:
-1 - Horário de atendimento
-2 - Endereço
-3 - Falar com atendente
-4 - Agendar consulta`;
-}
 
 function createInitialSession() {
   return {
@@ -51,11 +59,11 @@ function normalizeMessage(message) {
 }
 
 function isGreeting(text) {
-  return ['oi', 'olá', 'ola'].includes(text);
+  return ['oi', 'olá', 'ola', 'bom dia', 'boa tarde', 'boa noite'].includes(text);
 }
 
 function isMenuCommand(text) {
-  return text === 'menu';
+  return ['menu', 'inicio', 'início'].includes(text);
 }
 
 function isSchedulingStep(step) {
@@ -63,6 +71,7 @@ function isSchedulingStep(step) {
     SESSION_STEPS.AWAITING_NAME,
     SESSION_STEPS.AWAITING_DATE,
     SESSION_STEPS.AWAITING_TIME,
+    SESSION_STEPS.AWAITING_CONFIRMATION,
   ].includes(step);
 }
 
@@ -132,73 +141,109 @@ function closeSession(from) {
   });
 }
 
-function buildConfirmationMessage(session) {
-  return `Agendamento solicitado com sucesso ✅
+function startScheduling(from) {
+  resetSession(from);
+  setSessionStep(from, SESSION_STEPS.AWAITING_NAME);
 
-Nome: ${session.data.name}
-Data: ${session.data.date}
-Horário: ${session.data.time}
+  return getSchedulingWelcomeMessage();
+}
 
-Em breve entraremos em contato para confirmar.
+function restartScheduling(from) {
+  resetSession(from);
+  setSessionStep(from, SESSION_STEPS.AWAITING_NAME);
 
-Se quiser, digite menu para ver as opções novamente.`;
+  return getRestartSchedulingMessage();
+}
+
+async function submitAppointmentRequest(from, session) {
+  try {
+    console.log('[core] Iniciando persistencia oficial da solicitacao:', {
+      phone: from,
+      name: session.data.name,
+      requestedDate: session.data.date,
+      requestedTime: session.data.time,
+    });
+
+    const registrationResult = await registerAppointmentServiceRequest({
+      phone: from,
+      name: session.data.name,
+      requestedDate: session.data.date,
+      requestedTime: session.data.time,
+    });
+
+    console.log('[core] Persistencia oficial concluida:', {
+      projectId: registrationResult.project.id,
+      contactId: registrationResult.contact.id,
+      serviceRequestId: registrationResult.serviceRequest.id,
+      phone: from,
+    });
+
+    const successMessage = getRequestRegisteredMessage(session);
+    closeSession(from);
+
+    return successMessage;
+  } catch (error) {
+    console.error('[core] Erro ao registrar atendimento no core oficial:', error);
+    await logAppointmentRegistrationFailure({
+      phone: from,
+      projectId: error.projectId || null,
+      error,
+    });
+    return getRegistrationFailureMessage();
+  }
 }
 
 async function handleSchedulingFlow(from, messageText) {
   const session = ensureSession(from);
   const cleanedMessage = String(messageText || '').trim();
+  const normalizedMessage = normalizeMessage(messageText);
 
   if (session.step === SESSION_STEPS.AWAITING_NAME) {
-    session.data.name = cleanedMessage;
+    const nameResult = normalizeNameInput(cleanedMessage);
+
+    if (!nameResult.isValid) {
+      return getNameValidationMessage();
+    }
+
+    session.data.name = nameResult.value;
     setSessionStep(from, SESSION_STEPS.AWAITING_DATE);
-    return `Prazer, ${session.data.name}.
-Qual dia você deseja? Exemplo: 25/03`;
+    return getDatePromptMessage(session.data.name);
   }
 
   if (session.step === SESSION_STEPS.AWAITING_DATE) {
-    session.data.date = cleanedMessage;
+    const dateResult = normalizeDateInput(cleanedMessage);
+
+    if (!dateResult.isValid) {
+      return getDateValidationMessage();
+    }
+
+    session.data.date = dateResult.value;
     setSessionStep(from, SESSION_STEPS.AWAITING_TIME);
-    return 'Qual horário você deseja? Exemplo: 14:00';
+    return getTimePromptMessage();
   }
 
   if (session.step === SESSION_STEPS.AWAITING_TIME) {
-    session.data.time = cleanedMessage;
+    const timeResult = normalizeTimeInput(cleanedMessage);
 
-    try {
-      console.log('[core] Iniciando persistencia oficial do agendamento:', {
-        phone: from,
-        name: session.data.name,
-        requestedDate: session.data.date,
-        requestedTime: session.data.time,
-      });
-
-      const registrationResult = await registerAppointmentServiceRequest({
-        phone: from,
-        name: session.data.name,
-        requestedDate: session.data.date,
-        requestedTime: session.data.time,
-      });
-
-      console.log('[core] Persistencia oficial concluida:', {
-        projectId: registrationResult.project.id,
-        contactId: registrationResult.contact.id,
-        serviceRequestId: registrationResult.serviceRequest.id,
-        phone: from,
-      });
-
-      const confirmationMessage = buildConfirmationMessage(session);
-      closeSession(from);
-
-      return confirmationMessage;
-    } catch (error) {
-      console.error('[core] Erro ao registrar atendimento no core oficial:', error);
-      await logAppointmentRegistrationFailure({
-        phone: from,
-        projectId: error.projectId || null,
-        error,
-      });
-      return 'Houve um problema ao registrar seu atendimento. Tente novamente em instantes.';
+    if (!timeResult.isValid) {
+      return getTimeValidationMessage();
     }
+
+    session.data.time = timeResult.value;
+    setSessionStep(from, SESSION_STEPS.AWAITING_CONFIRMATION);
+    return getRequestConfirmationMessage(session);
+  }
+
+  if (session.step === SESSION_STEPS.AWAITING_CONFIRMATION) {
+    if (['1', 'confirmar', 'sim'].includes(normalizedMessage)) {
+      return submitAppointmentRequest(from, session);
+    }
+
+    if (['2', 'corrigir'].includes(normalizedMessage)) {
+      return restartScheduling(from);
+    }
+
+    return getConfirmationChoiceErrorMessage();
   }
 
   return null;
@@ -226,7 +271,7 @@ async function montarRespostaBot(from, mensagemTexto) {
 
   if (isMenuCommand(textoNormalizado) || isGreeting(textoNormalizado)) {
     resetSession(from);
-    return getMainMenu();
+    return getWelcomeMenuMessage();
   }
 
   if (currentSession && isSchedulingStep(currentSession.step)) {
@@ -234,24 +279,23 @@ async function montarRespostaBot(from, mensagemTexto) {
   }
 
   if (textoNormalizado === '1') {
-    return 'Nosso horário é de segunda a sexta, das 08:00 às 18:00.';
+    return startScheduling(from);
   }
 
   if (textoNormalizado === '2') {
-    return 'Estamos na Rua Exemplo, 123 - Centro.';
+    return getHoursMessage();
   }
 
   if (textoNormalizado === '3') {
-    return 'Um atendente irá falar com você em breve.';
+    return getAddressMessage();
   }
 
   if (textoNormalizado === '4') {
     resetSession(from);
-    setSessionStep(from, SESSION_STEPS.AWAITING_NAME);
-    return 'Perfeito! Vamos iniciar seu agendamento.\n\nQual é o seu nome?';
+    return getTalkToTeamMessage();
   }
 
-  return "Não entendi sua mensagem. Digite 'menu' para ver as opções.";
+  return getConversationFallbackMessage();
 }
 
 module.exports = async function handler(req, res) {
