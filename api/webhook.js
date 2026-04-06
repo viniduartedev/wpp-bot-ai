@@ -35,6 +35,7 @@ const { handleDevCommand } = require('../lib/dev/commands');
 const {
   clearSessionProjectOverride,
   getSessionProjectOverride,
+  normalizeTenantSlug,
   setSessionProjectOverride,
 } = require('../lib/dev/projectOverride');
 const {
@@ -85,6 +86,10 @@ function buildSessionContext(from, routingContext) {
     from: String(from || '').trim(),
     to: routingContext?.to || null,
     projectId: routingContext?.project?.id || null,
+    tenantSlug:
+      normalizeTenantSlug(
+        routingContext?.tenantSlug || routingContext?.project?.tenantSlug || routingContext?.project?.slug,
+      ) || null,
     connectionId: routingContext?.connection?.id || null,
     connectionIdentifier: routingContext?.connection?.identifier || routingContext?.to || null,
     botProfile: routingContext?.botProfile || null,
@@ -98,8 +103,14 @@ function buildSessionContext(from, routingContext) {
 }
 
 function createInitialSession(context = {}, projectOverride = null) {
+  const tenantSlug =
+    normalizeTenantSlug(
+      context.tenantSlug || projectOverride?.tenantSlug || projectOverride?.projectSlug,
+    ) || null;
+
   return {
     step: SESSION_STEPS.MENU,
+    tenantSlug,
     data: {
       selectedServiceKey: '',
       selectedServiceLabel: '',
@@ -112,6 +123,7 @@ function createInitialSession(context = {}, projectOverride = null) {
       from: context.from || '',
       to: context.to || null,
       projectId: context.projectId || null,
+      tenantSlug,
       connectionId: context.connectionId || null,
       connectionIdentifier: context.connectionIdentifier || null,
       botProfile: context.botProfile || null,
@@ -160,6 +172,7 @@ function logCurrentSession(sessionKey) {
 
   console.log('[session] Estado atual:', {
     sessionKey,
+    tenantSlug: sessions[sessionKey].tenantSlug || null,
     step: sessions[sessionKey].step,
     data: sessions[sessionKey].data,
     projectOverride: sessions[sessionKey].projectOverride || null,
@@ -177,9 +190,16 @@ function ensureSession(sessionKey, context = {}) {
       context: sessions[sessionKey].context,
     });
   } else if (Object.keys(context).length > 0) {
+    const contextTenantSlug =
+      Object.prototype.hasOwnProperty.call(context, 'tenantSlug')
+        ? normalizeTenantSlug(context.tenantSlug)
+        : sessions[sessionKey].tenantSlug || null;
+
+    sessions[sessionKey].tenantSlug = contextTenantSlug;
     sessions[sessionKey].context = {
       ...sessions[sessionKey].context,
       ...context,
+      tenantSlug: contextTenantSlug,
     };
   }
 
@@ -258,17 +278,30 @@ function closeSession(sessionKey, context = {}) {
 }
 
 function resolveProjectServices(routingContext, options = {}) {
-  const serviceCatalog = loadProjectServices(routingContext?.project || null);
+  const tenantSlug =
+    normalizeTenantSlug(
+      options.session?.tenantSlug ||
+        options.tenantSlug ||
+        routingContext?.tenantSlug ||
+        routingContext?.project?.tenantSlug ||
+        routingContext?.project?.slug,
+    ) || null;
+  const serviceCatalog = loadProjectServices(routingContext?.project || null, { tenantSlug });
 
   if (options.log !== false) {
+    const serviceKeys = serviceCatalog.services.map((service) => service.key);
+
+    console.log(`[bot] servicesLoaded=${serviceCatalog.services.length}`);
+    console.log(`[bot] servicesKeys=[${serviceKeys.join(', ')}]`);
     console.log('[services] Servicos carregados para o fluxo de agendamento:', {
       projectId: routingContext?.project?.id || null,
       projectSlug: routingContext?.project?.slug || null,
+      tenantSlug,
       source: serviceCatalog.source,
       resolvedFrom: serviceCatalog.resolvedFrom || null,
       usedFallback: serviceCatalog.usedFallback,
       totalServices: serviceCatalog.services.length,
-      serviceKeys: serviceCatalog.services.map((service) => service.key),
+      serviceKeys,
     });
   }
 
@@ -285,8 +318,9 @@ function getSelectedServiceFromSession(session) {
 function startScheduling(sessionKey, context, routingContext) {
   resetSession(sessionKey, context);
   setSessionStep(sessionKey, SESSION_STEPS.AWAITING_SERVICE);
+  const session = ensureSession(sessionKey, context);
 
-  const serviceCatalog = resolveProjectServices(routingContext);
+  const serviceCatalog = resolveProjectServices(routingContext, { session });
 
   if (serviceCatalog.services.length === 0) {
     return getServiceUnavailableMessage(context.botProfile || null);
@@ -298,8 +332,9 @@ function startScheduling(sessionKey, context, routingContext) {
 function restartScheduling(sessionKey, context, routingContext) {
   resetSession(sessionKey, context);
   setSessionStep(sessionKey, SESSION_STEPS.AWAITING_SERVICE);
+  const session = ensureSession(sessionKey, context);
 
-  const serviceCatalog = resolveProjectServices(routingContext);
+  const serviceCatalog = resolveProjectServices(routingContext, { session });
 
   if (serviceCatalog.services.length === 0) {
     return getServiceUnavailableMessage(context.botProfile || null);
@@ -312,12 +347,20 @@ ${serviceCatalog.services.map((service, index) => `${index + 1} - ${service.labe
 
 async function submitAppointmentRequest(sessionKey, from, session, routingContext) {
   const selectedService = getSelectedServiceFromSession(session);
+  const tenantSlug =
+    normalizeTenantSlug(
+      session?.tenantSlug ||
+        routingContext?.tenantSlug ||
+        routingContext?.project?.tenantSlug ||
+        routingContext?.project?.slug,
+    ) || null;
 
   try {
     console.log('[core] Iniciando persistencia oficial da solicitacao:', {
       phone: from,
       to: routingContext.to,
       projectId: routingContext.project.id,
+      tenantSlug,
       connectionId: routingContext.connection?.id || null,
       routingSource: routingContext.routingSource || null,
       devMode: routingContext.devMode || false,
@@ -335,12 +378,14 @@ async function submitAppointmentRequest(sessionKey, from, session, routingContex
       name: session.data.name,
       requestedDate: session.data.date,
       requestedTime: session.data.time,
+      tenantSlug,
       service: selectedService,
       routingContext,
     });
 
     console.log('[core] Persistencia oficial concluida:', {
       projectId: registrationResult.project.id,
+      tenantSlug: registrationResult.serviceRequest.data.tenantSlug || tenantSlug,
       connectionId: routingContext.connection?.id || null,
       contactId: registrationResult.contact.id,
       serviceRequestId: registrationResult.serviceRequest.id,
@@ -372,6 +417,7 @@ async function submitAppointmentRequest(sessionKey, from, session, routingContex
         connectionId: error.connectionId || routingContext.connection?.id || null,
         connectionIdentifier:
           routingContext.connection?.identifier || routingContext.to || null,
+        tenantSlug,
         botProfileId: routingContext.botProfile?.id || null,
         botProfileFallbackUsed: routingContext.botProfile?.fallbackUsed || false,
         service: selectedService,
@@ -386,6 +432,7 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
   const cleanedMessage = String(messageText || '').trim();
   const normalizedMessage = normalizeMessage(messageText);
   const serviceCatalog = resolveProjectServices(routingContext, {
+    session,
     log: session.step === SESSION_STEPS.AWAITING_SERVICE,
   });
 
@@ -413,6 +460,7 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
       console.warn('[services] Servico invalido informado pelo usuario.', {
         sessionKey,
         projectId: routingContext?.project?.id || null,
+        tenantSlug: session?.tenantSlug || routingContext?.tenantSlug || null,
         input: cleanedMessage,
         code: serviceSelection.code,
       });
@@ -425,6 +473,7 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
     console.log('[services] Servico selecionado na sessao:', {
       sessionKey,
       projectId: routingContext?.project?.id || null,
+      tenantSlug: session?.tenantSlug || routingContext?.tenantSlug || null,
       serviceKey: session.data.selectedServiceKey,
       serviceLabel: session.data.selectedServiceLabel,
     });
@@ -622,6 +671,10 @@ async function handler(req, res) {
   });
 
   if (devCommandResult.matched) {
+    const devCommandSuffix = devCommandResult.parsedCommand?.normalizedInput
+      ? ` ${devCommandResult.parsedCommand.normalizedInput}`
+      : '';
+    console.log(`[bot] command=/dev${devCommandSuffix}`);
     console.log('[dev] Comando recebido:', {
       from,
       to,
@@ -637,6 +690,13 @@ async function handler(req, res) {
 
     if (devCommandResult.action === 'set_project' && devCommandResult.project) {
       const projectOverride = setSessionProjectOverride(session, devCommandResult.project);
+      const tenantSlug =
+        normalizeTenantSlug(
+          projectOverride?.tenantSlug ||
+            devCommandResult.project?.tenantSlug ||
+            devCommandResult.project?.slug ||
+            devCommandResult.resolution?.resolvedSlug,
+        ) || null;
 
       resetSession(
         sessionKey,
@@ -644,6 +704,7 @@ async function handler(req, res) {
           from,
           to: String(to || '').trim().toLowerCase() || null,
           projectId: devCommandResult.project.id,
+          tenantSlug,
           devMode: true,
           projectOverrideUsed: true,
           routingSource: 'session_override',
@@ -651,6 +712,7 @@ async function handler(req, res) {
         { preserveProjectOverride: true },
       );
 
+      console.log(`[bot] tenantSelected=${tenantSlug || 'null'}`);
       console.log('[dev] Override de projeto ativado:', {
         from,
         to,
@@ -668,6 +730,7 @@ async function handler(req, res) {
         {
           from,
           to: String(to || '').trim().toLowerCase() || null,
+          tenantSlug: null,
           devMode: false,
           projectOverrideUsed: false,
           routingSource: 'incoming_number',
@@ -775,6 +838,7 @@ async function handler(req, res) {
     from,
     to: routingContext.to,
     projectId: routingContext.project.id,
+    tenantSlug: routingContext.tenantSlug || null,
     connectionId: routingContext.connection?.id || null,
     routingSource: routingContext.routingSource || null,
     devMode: routingContext.devMode || false,
