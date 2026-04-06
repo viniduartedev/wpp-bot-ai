@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "description": "Bot de WhatsApp para recepção de solicitações de atendimento e agendamento",
   "main": "api/webhook.js",
-  "scripts": {},
+  "scripts": {
+    "test": "node --test"
+  },
   "keywords": [
     "twilio",
     "whatsapp",

@@ -8,11 +8,14 @@ const {
   getDatePromptMessage,
   getDateValidationMessage,
   getHoursMessage,
+  getNamePromptMessage,
   getNameValidationMessage,
   getRegistrationFailureMessage,
   getRequestConfirmationMessage,
   getRequestRegisteredMessage,
   getRestartSchedulingMessage,
+  getServiceSelectionErrorMessage,
+  getServiceUnavailableMessage,
   getSchedulingWelcomeMessage,
   getTalkToTeamMessage,
   getTimePromptMessage,
@@ -23,6 +26,11 @@ const {
   buildEffectiveBotProfile,
   resolveMenuOptionKey,
 } = require('../lib/bot/profile');
+const {
+  loadProjectServices,
+  normalizeSelectedService,
+  resolveServiceSelection,
+} = require('../lib/bot/services');
 const { handleDevCommand } = require('../lib/dev/commands');
 const {
   clearSessionProjectOverride,
@@ -48,6 +56,7 @@ const { resolveProjectForConversation } = require('../lib/routing/resolveProject
 
 const SESSION_STEPS = {
   MENU: 'menu',
+  AWAITING_SERVICE: 'awaiting_service',
   AWAITING_NAME: 'awaiting_name',
   AWAITING_DATE: 'awaiting_date',
   AWAITING_TIME: 'awaiting_time',
@@ -92,6 +101,8 @@ function createInitialSession(context = {}, projectOverride = null) {
   return {
     step: SESSION_STEPS.MENU,
     data: {
+      selectedServiceKey: '',
+      selectedServiceLabel: '',
       name: '',
       date: '',
       time: '',
@@ -133,6 +144,7 @@ function isMenuCommand(text) {
 
 function isSchedulingStep(step) {
   return [
+    SESSION_STEPS.AWAITING_SERVICE,
     SESSION_STEPS.AWAITING_NAME,
     SESSION_STEPS.AWAITING_DATE,
     SESSION_STEPS.AWAITING_TIME,
@@ -245,21 +257,62 @@ function closeSession(sessionKey, context = {}) {
   });
 }
 
-function startScheduling(sessionKey, context) {
-  resetSession(sessionKey, context);
-  setSessionStep(sessionKey, SESSION_STEPS.AWAITING_NAME);
+function resolveProjectServices(routingContext, options = {}) {
+  const serviceCatalog = loadProjectServices(routingContext?.project || null);
 
-  return getSchedulingWelcomeMessage(context.botProfile || null);
+  if (options.log !== false) {
+    console.log('[services] Servicos carregados para o fluxo de agendamento:', {
+      projectId: routingContext?.project?.id || null,
+      projectSlug: routingContext?.project?.slug || null,
+      source: serviceCatalog.source,
+      resolvedFrom: serviceCatalog.resolvedFrom || null,
+      usedFallback: serviceCatalog.usedFallback,
+      totalServices: serviceCatalog.services.length,
+      serviceKeys: serviceCatalog.services.map((service) => service.key),
+    });
+  }
+
+  return serviceCatalog;
 }
 
-function restartScheduling(sessionKey, context) {
-  resetSession(sessionKey, context);
-  setSessionStep(sessionKey, SESSION_STEPS.AWAITING_NAME);
+function getSelectedServiceFromSession(session) {
+  return normalizeSelectedService({
+    key: session?.data?.selectedServiceKey,
+    label: session?.data?.selectedServiceLabel,
+  });
+}
 
-  return getRestartSchedulingMessage(context.botProfile || null);
+function startScheduling(sessionKey, context, routingContext) {
+  resetSession(sessionKey, context);
+  setSessionStep(sessionKey, SESSION_STEPS.AWAITING_SERVICE);
+
+  const serviceCatalog = resolveProjectServices(routingContext);
+
+  if (serviceCatalog.services.length === 0) {
+    return getServiceUnavailableMessage(context.botProfile || null);
+  }
+
+  return getSchedulingWelcomeMessage(context.botProfile || null, serviceCatalog.services);
+}
+
+function restartScheduling(sessionKey, context, routingContext) {
+  resetSession(sessionKey, context);
+  setSessionStep(sessionKey, SESSION_STEPS.AWAITING_SERVICE);
+
+  const serviceCatalog = resolveProjectServices(routingContext);
+
+  if (serviceCatalog.services.length === 0) {
+    return getServiceUnavailableMessage(context.botProfile || null);
+  }
+
+  return `${getRestartSchedulingMessage(context.botProfile || null)}
+
+${serviceCatalog.services.map((service, index) => `${index + 1} - ${service.label}`).join('\n')}`;
 }
 
 async function submitAppointmentRequest(sessionKey, from, session, routingContext) {
+  const selectedService = getSelectedServiceFromSession(session);
+
   try {
     console.log('[core] Iniciando persistencia oficial da solicitacao:', {
       phone: from,
@@ -271,6 +324,7 @@ async function submitAppointmentRequest(sessionKey, from, session, routingContex
       projectOverrideUsed: routingContext.projectOverrideUsed || false,
       botProfileId: routingContext.botProfile?.id || null,
       botProfileFallbackUsed: routingContext.botProfile?.fallbackUsed || false,
+      service: selectedService,
       name: session.data.name,
       requestedDate: session.data.date,
       requestedTime: session.data.time,
@@ -281,6 +335,7 @@ async function submitAppointmentRequest(sessionKey, from, session, routingContex
       name: session.data.name,
       requestedDate: session.data.date,
       requestedTime: session.data.time,
+      service: selectedService,
       routingContext,
     });
 
@@ -292,6 +347,7 @@ async function submitAppointmentRequest(sessionKey, from, session, routingContex
       phone: from,
       to: routingContext.to,
       botProfileId: routingContext.botProfile?.id || null,
+      service: selectedService,
     });
 
     const successMessage = getRequestRegisteredMessage(routingContext.botProfile, session);
@@ -318,6 +374,7 @@ async function submitAppointmentRequest(sessionKey, from, session, routingContex
           routingContext.connection?.identifier || routingContext.to || null,
         botProfileId: routingContext.botProfile?.id || null,
         botProfileFallbackUsed: routingContext.botProfile?.fallbackUsed || false,
+        service: selectedService,
       },
     });
     return getRegistrationFailureMessage(routingContext.botProfile);
@@ -328,6 +385,53 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
   const session = ensureSession(sessionKey, buildSessionContext(from, routingContext));
   const cleanedMessage = String(messageText || '').trim();
   const normalizedMessage = normalizeMessage(messageText);
+  const serviceCatalog = resolveProjectServices(routingContext, {
+    log: session.step === SESSION_STEPS.AWAITING_SERVICE,
+  });
+
+  if (serviceCatalog.services.length === 0) {
+    console.warn('[services] Fluxo de agendamento sem servicos disponiveis.', {
+      sessionKey,
+      projectId: routingContext?.project?.id || null,
+    });
+    return getServiceUnavailableMessage(routingContext.botProfile);
+  }
+
+  if (session.step !== SESSION_STEPS.AWAITING_SERVICE && !getSelectedServiceFromSession(session)) {
+    console.warn('[services] Sessao sem servico selecionado. Reiniciando etapa de escolha.', {
+      sessionKey,
+      step: session.step,
+      projectId: routingContext?.project?.id || null,
+    });
+    return startScheduling(sessionKey, buildSessionContext(from, routingContext), routingContext);
+  }
+
+  if (session.step === SESSION_STEPS.AWAITING_SERVICE) {
+    const serviceSelection = resolveServiceSelection(cleanedMessage, serviceCatalog.services);
+
+    if (!serviceSelection.isValid) {
+      console.warn('[services] Servico invalido informado pelo usuario.', {
+        sessionKey,
+        projectId: routingContext?.project?.id || null,
+        input: cleanedMessage,
+        code: serviceSelection.code,
+      });
+      return getServiceSelectionErrorMessage(serviceCatalog.services);
+    }
+
+    session.data.selectedServiceKey = serviceSelection.service.key;
+    session.data.selectedServiceLabel = serviceSelection.service.label;
+
+    console.log('[services] Servico selecionado na sessao:', {
+      sessionKey,
+      projectId: routingContext?.project?.id || null,
+      serviceKey: session.data.selectedServiceKey,
+      serviceLabel: session.data.selectedServiceLabel,
+    });
+
+    setSessionStep(sessionKey, SESSION_STEPS.AWAITING_NAME);
+    return getNamePromptMessage(routingContext.botProfile, session.data.selectedServiceLabel);
+  }
 
   if (session.step === SESSION_STEPS.AWAITING_NAME) {
     const nameResult = normalizeNameInput(cleanedMessage);
@@ -371,7 +475,11 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
     }
 
     if (['2', 'corrigir', 'editar', 'nao', 'não'].includes(normalizedMessage)) {
-      return restartScheduling(sessionKey, buildSessionContext(from, routingContext));
+      return restartScheduling(
+        sessionKey,
+        buildSessionContext(from, routingContext),
+        routingContext,
+      );
     }
 
     return getConfirmationChoiceErrorMessage();
@@ -418,7 +526,7 @@ async function montarRespostaBot({ sessionKey, from, routingContext, mensagemTex
   const selectedMenuKey = resolveMenuOptionKey(textoNormalizado, botProfile);
 
   if (selectedMenuKey === 'schedule') {
-    return startScheduling(sessionKey, buildSessionContext(from, routingContext));
+    return startScheduling(sessionKey, buildSessionContext(from, routingContext), routingContext);
   }
 
   if (selectedMenuKey === 'hours') {
@@ -486,7 +594,7 @@ async function resolveBotProfileContext(from, to, routingContext) {
   return effectiveBotProfile;
 }
 
-module.exports = async function handler(req, res) {
+async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
     return res.status(405).send('Method Not Allowed');
@@ -690,4 +798,29 @@ module.exports = async function handler(req, res) {
 
   res.setHeader('Content-Type', 'text/xml');
   return res.status(200).send(twiml.toString());
+}
+
+function clearSessions() {
+  Object.keys(sessions).forEach((sessionKey) => {
+    delete sessions[sessionKey];
+  });
+}
+
+module.exports = handler;
+module.exports.__internals = {
+  SESSION_STEPS,
+  buildSessionContext,
+  buildSessionKey,
+  clearSessions,
+  createInitialSession,
+  ensureSession,
+  getSelectedServiceFromSession,
+  handleSchedulingFlow,
+  isSchedulingStep,
+  montarRespostaBot,
+  normalizeMessage,
+  resetSession,
+  resolveProjectServices,
+  sessions,
+  startScheduling,
 };
