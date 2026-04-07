@@ -1,7 +1,8 @@
 # wpp-bot-ai
 
 Runtime Twilio/WhatsApp do bot. A partir desta fase, o runtime usa o Firebase
-`bot-whatsapp-ai-d10ef` como dominio conversacional do bot/core.
+`bot-whatsapp-ai-d10ef` como dominio conversacional do bot/core e le os
+servicos reais na base operacional `agendamento-ai-9fbfb`.
 
 ## Firebase
 
@@ -10,6 +11,8 @@ Configure o runtime com variaveis explicitas do bot:
 ```env
 BOT_FIREBASE_PROJECT_ID=bot-whatsapp-ai-d10ef
 BOT_FIREBASE_SERVICE_ACCOUNT_KEY={...json da service account do projeto bot-whatsapp-ai-d10ef...}
+AGENDA_FIREBASE_PROJECT_ID=agendamento-ai-9fbfb
+AGENDA_FIREBASE_SERVICE_ACCOUNT_KEY={...json da service account do projeto agendamento-ai-9fbfb...}
 BOT_RUNTIME_ENV=dev
 ENABLE_DEV_COMMANDS=true
 ```
@@ -27,8 +30,9 @@ slugs sao rejeitados nesta fase.
 
 1. Envie `/dev clinica-devtec` no WhatsApp Sandbox, se precisar reiniciar o contexto dev.
 2. O runtime grava sempre `session.tenantSlug=clinica-devtec` em `botDb/sessions`.
-3. Ao iniciar agendamento, os servicos ativos sao lidos de `botDb/services`
-   filtrando somente `tenantSlug=clinica-devtec`.
+3. Ao iniciar agendamento, os servicos ativos sao lidos de
+   `agendamento-ai-9fbfb/services` via `agendaDb`, filtrando somente
+   `tenantSlug=clinica-devtec`.
 4. Ao confirmar, o runtime cria `serviceRequests` em `bot-whatsapp-ai-d10ef`
    com `tenantSlug=clinica-devtec`, `service.key` e `service.label`.
 5. O core segue responsavel por integrar o appointment operacional em
@@ -38,6 +42,8 @@ Logs esperados na homologacao:
 
 ```txt
 [bot-runtime] firebaseProject=bot-whatsapp-ai-d10ef
+[bot-runtime] agendaFirebaseProject=agendamento-ai-9fbfb
+[bot] servicesSource=agendamento-ai-9fbfb
 [bot] tenantSelected=clinica-devtec
 [bot] servicesLoaded=<n>
 [bot] serviceSelected=<key>

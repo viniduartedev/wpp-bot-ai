@@ -306,7 +306,11 @@ async function resolveProjectServices(routingContext, options = {}) {
 
   if (options.log !== false) {
     const serviceKeys = serviceCatalog.services.map((service) => service.key);
+    const servicesSource =
+      serviceCatalog.servicesSource || serviceCatalog.firebaseProjectId || serviceCatalog.source || null;
 
+    console.log(`[bot] servicesSource=${servicesSource || 'unknown'}`);
+    console.log(`[bot] tenantSelected=${tenantSlug}`);
     console.log(`[bot] servicesLoaded=${serviceCatalog.services.length}`);
     console.log(`[bot-runtime] servicesKeys=[${serviceKeys.join(', ')}]`);
     console.log('[services] Servicos carregados para o fluxo de agendamento:', {
@@ -315,6 +319,7 @@ async function resolveProjectServices(routingContext, options = {}) {
       activeTenantSlug: tenantSlug,
       tenantSlug,
       firebaseProjectId: serviceCatalog.firebaseProjectId || null,
+      servicesSource,
       source: serviceCatalog.source,
       resolvedFrom: serviceCatalog.resolvedFrom || null,
       usedFallback: serviceCatalog.usedFallback,

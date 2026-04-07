@@ -20,6 +20,114 @@ const {
   startScheduling,
 } = webhookHandler.__internals;
 
+const firebaseAdminModulePath = require.resolve('../lib/firebase-admin');
+const originalFirebaseAdminModule = require.cache[firebaseAdminModulePath];
+
+const DEFAULT_AGENDA_SERVICES = [
+  {
+    id: 'clinica-devtec-consulta',
+    tenantSlug: 'clinica-devtec',
+    key: 'consulta',
+    label: 'Consulta',
+    active: true,
+    order: 1,
+  },
+  {
+    id: 'clinica-devtec-retorno',
+    tenantSlug: 'clinica-devtec',
+    key: 'retorno',
+    label: 'Retorno',
+    active: true,
+    order: 2,
+  },
+  {
+    id: 'clinica-devtec-exame',
+    tenantSlug: 'clinica-devtec',
+    key: 'exame',
+    label: 'Exame',
+    active: true,
+    order: 3,
+  },
+];
+
+function restoreFirebaseAdminModule() {
+  if (originalFirebaseAdminModule) {
+    require.cache[firebaseAdminModulePath] = originalFirebaseAdminModule;
+  } else {
+    delete require.cache[firebaseAdminModulePath];
+  }
+}
+
+function setFirebaseAdminMock(options = {}) {
+  const agendaServices = options.agendaServices ?? DEFAULT_AGENDA_SERVICES;
+  const queriedFilters = options.queriedFilters || [];
+  const agendaProjectId = options.agendaProjectId || 'agendamento-ai-9fbfb';
+  const fakeAdmin = {
+    firestore: {
+      FieldValue: {
+        serverTimestamp: () => 'server-timestamp',
+      },
+    },
+  };
+  const fakeBotDb = {
+    batch: () => ({
+      set: () => {},
+      commit: async () => {},
+    }),
+    collection: () => ({
+      doc: () => ({
+        set: async () => {},
+      }),
+    }),
+  };
+
+  require.cache[firebaseAdminModulePath] = {
+    id: firebaseAdminModulePath,
+    filename: firebaseAdminModulePath,
+    loaded: true,
+    exports: {
+      EXPECTED_AGENDA_FIREBASE_PROJECT_ID: 'agendamento-ai-9fbfb',
+      EXPECTED_BOT_FIREBASE_PROJECT_ID: 'bot-whatsapp-ai-d10ef',
+      getFirestoreClients: () => ({
+        admin: fakeAdmin,
+        botDb: fakeBotDb,
+        firebaseProjectId: 'bot-whatsapp-ai-d10ef',
+      }),
+      getAgendaFirestoreClient: () => ({
+        admin: fakeAdmin,
+        agendaDb: {
+          collection: (collectionName) => {
+            if (options.onAgendaCollection) {
+              options.onAgendaCollection(collectionName);
+            }
+
+            return {
+              where: (field, operator, value) => {
+                queriedFilters.push({ field, operator, value });
+
+                return {
+                  get: async () => ({
+                    docs: agendaServices.map((service) => ({
+                      id: service.id,
+                      data: () => service,
+                    })),
+                  }),
+                };
+              },
+            };
+          },
+        },
+        agendaFirebaseProjectId: agendaProjectId,
+        firebaseProjectId: agendaProjectId,
+      }),
+    },
+  };
+
+  return {
+    queriedFilters,
+  };
+}
+
 function buildRoutingContext(overrides = {}) {
   return {
     to: 'whatsapp:+5511999999999',
@@ -55,11 +163,13 @@ function buildRoutingContext(overrides = {}) {
 test.beforeEach(() => {
   clearSessions();
   delete process.env.BOT_PROJECT_SERVICES_JSON;
+  setFirebaseAdminMock();
 });
 
 test.after(() => {
   clearSessions();
   delete process.env.BOT_PROJECT_SERVICES_JSON;
+  restoreFirebaseAdminModule();
 });
 
 test('inicia agendamento pedindo a escolha do serviço', async () => {
@@ -264,9 +374,7 @@ test('mantem fallback preso ao tenant ativo mesmo se outro tenant for informado'
   );
 });
 
-test('carrega serviços reais do tenant pelo botDb antes do fallback legado', async () => {
-  const firebaseAdminModulePath = require.resolve('../lib/firebase-admin');
-  const previousFirebaseAdminModule = require.cache[firebaseAdminModulePath];
+test('carrega serviços reais do tenant pelo agendaDb operacional', async () => {
   const queriedFilters = [];
   const fakeServices = [
     {
@@ -276,7 +384,7 @@ test('carrega serviços reais do tenant pelo botDb antes do fallback legado', as
       key: 'retorno',
       label: 'Retorno',
       active: true,
-      order: 2,
+      sortOrder: '2',
     },
     {
       id: 'clinica-devtec-consulta-avaliacao',
@@ -303,7 +411,7 @@ test('carrega serviços reais do tenant pelo botDb antes do fallback legado', as
       key: 'procedimento',
       label: 'Procedimento',
       active: true,
-      order: 3,
+      displayOrder: 3,
     },
     {
       id: 'barbearia-premium-corte',
@@ -316,120 +424,57 @@ test('carrega serviços reais do tenant pelo botDb antes do fallback legado', as
     },
   ];
 
-  require.cache[firebaseAdminModulePath] = {
-    id: firebaseAdminModulePath,
-    filename: firebaseAdminModulePath,
-    loaded: true,
-    exports: {
-      getFirestoreClients: () => ({
-        firebaseProjectId: 'bot-whatsapp-ai-d10ef',
-        botDb: {
-          collection: (collectionName) => {
-            assert.equal(collectionName, 'services');
-
-            return {
-              where: (field, operator, value) => {
-                queriedFilters.push({ field, operator, value });
-
-                return {
-                  get: async () => ({
-                    docs: fakeServices.map((service) => ({
-                      id: service.id,
-                      data: () => service,
-                    })),
-                  }),
-                };
-              },
-            };
-          },
-        },
-      }),
+  setFirebaseAdminMock({
+    agendaServices: fakeServices,
+    queriedFilters,
+    onAgendaCollection: (collectionName) => {
+      assert.equal(collectionName, 'services');
     },
-  };
+  });
 
-  try {
-    const catalog = await loadRuntimeProjectServices(
-      {
-        id: 'core-project-clinica-devtec',
-        slug: 'clinica-devtec',
-      },
-      {
-        tenantSlug: 'clinica-devtec',
-      },
-    );
+  const catalog = await loadRuntimeProjectServices(
+    {
+      id: 'core-project-clinica-devtec',
+      slug: 'clinica-devtec',
+    },
+    {
+      tenantSlug: 'clinica-devtec',
+    },
+  );
 
-    assert.equal(catalog.source, 'bot_firestore_services');
-    assert.equal(catalog.firebaseProjectId, 'bot-whatsapp-ai-d10ef');
-    assert.deepEqual(queriedFilters, [
-      { field: 'tenantSlug', operator: '==', value: 'clinica-devtec' },
-    ]);
-    assert.deepEqual(
-      catalog.services.map((service) => service.key),
-      ['consulta_avaliacao', 'retorno', 'procedimento'],
-    );
-  } finally {
-    if (previousFirebaseAdminModule) {
-      require.cache[firebaseAdminModulePath] = previousFirebaseAdminModule;
-    } else {
-      delete require.cache[firebaseAdminModulePath];
-    }
-  }
+  assert.equal(catalog.source, 'agenda_firestore_services');
+  assert.equal(catalog.servicesSource, 'agendamento-ai-9fbfb');
+  assert.equal(catalog.firebaseProjectId, 'agendamento-ai-9fbfb');
+  assert.deepEqual(queriedFilters, [
+    { field: 'tenantSlug', operator: '==', value: 'clinica-devtec' },
+  ]);
+  assert.deepEqual(
+    catalog.services.map((service) => service.key),
+    ['consulta_avaliacao', 'retorno', 'procedimento'],
+  );
 });
 
-test('nao aplica fallback quando o botDb responde sem servicos ativos para o tenant', async () => {
-  const firebaseAdminModulePath = require.resolve('../lib/firebase-admin');
-  const previousFirebaseAdminModule = require.cache[firebaseAdminModulePath];
+test('nao aplica fallback quando a agenda responde sem servicos ativos para o tenant', async () => {
   process.env.BOT_PROJECT_SERVICES_JSON = JSON.stringify({
     'clinica-devtec': [{ key: 'consulta', label: 'Consulta' }],
   });
 
-  require.cache[firebaseAdminModulePath] = {
-    id: firebaseAdminModulePath,
-    filename: firebaseAdminModulePath,
-    loaded: true,
-    exports: {
-      getFirestoreClients: () => ({
-        firebaseProjectId: 'bot-whatsapp-ai-d10ef',
-        botDb: {
-          collection: (collectionName) => {
-            assert.equal(collectionName, 'services');
-
-            return {
-              where: (field, operator, value) => {
-                assert.equal(field, 'tenantSlug');
-                assert.equal(operator, '==');
-                assert.equal(value, 'clinica-devtec');
-
-                return {
-                  get: async () => ({
-                    docs: [],
-                  }),
-                };
-              },
-            };
-          },
-        },
-      }),
+  setFirebaseAdminMock({
+    agendaServices: [],
+    onAgendaCollection: (collectionName) => {
+      assert.equal(collectionName, 'services');
     },
-  };
+  });
 
-  try {
-    const catalog = await loadRuntimeProjectServices({
-      id: 'core-project-clinica-devtec',
-      slug: 'clinica-devtec',
-    });
+  const catalog = await loadRuntimeProjectServices({
+    id: 'core-project-clinica-devtec',
+    slug: 'clinica-devtec',
+  });
 
-    assert.equal(catalog.source, 'bot_firestore_services');
-    assert.equal(catalog.tenantSlug, 'clinica-devtec');
-    assert.equal(catalog.usedFallback, false);
-    assert.deepEqual(catalog.services, []);
-  } finally {
-    if (previousFirebaseAdminModule) {
-      require.cache[firebaseAdminModulePath] = previousFirebaseAdminModule;
-    } else {
-      delete require.cache[firebaseAdminModulePath];
-    }
-  }
+  assert.equal(catalog.source, 'agenda_firestore_services');
+  assert.equal(catalog.tenantSlug, 'clinica-devtec');
+  assert.equal(catalog.usedFallback, false);
+  assert.deepEqual(catalog.services, []);
 });
 
 test('monta payload de sessão com tenant e serviço selecionado para o botDb', () => {
