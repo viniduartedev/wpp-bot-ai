@@ -5,7 +5,7 @@ const webhookHandler = require('../api/webhook');
 const { buildServiceRequestData } = require('../lib/core/serviceRequests');
 const { loadProjectServices, loadRuntimeProjectServices } = require('../lib/bot/services');
 const { buildSessionData } = require('../lib/core/sessions');
-const { parseDevCommand } = require('../lib/dev/commands');
+const { parseDevCommand, resolveProjectByDevInput } = require('../lib/dev/commands');
 const { setSessionProjectOverride } = require('../lib/dev/projectOverride');
 
 const {
@@ -115,6 +115,12 @@ test('normaliza o tenant informado no comando /dev', () => {
   assert.equal(parsedCommand?.normalizedInput, 'clinica-devtec');
 });
 
+test('bloqueia outros slugs no /dev temporario', async () => {
+  const resolution = await resolveProjectByDevInput('barbearia-premium');
+
+  assert.equal(resolution, null);
+});
+
 test('preserva tenantSlug na sessão ao aplicar override via /dev', () => {
   const from = 'whatsapp:+5534999991111';
   const to = 'whatsapp:+5511999999999';
@@ -177,7 +183,7 @@ test('inclui o serviço no payload persistido da serviceRequest', () => {
   const serviceRequestData = buildServiceRequestData(
     {
       projectId: 'clinic-project',
-      tenantSlug: 'CLINICA-DEVTEC',
+      tenantSlug: 'BARBEARIA-PREMIUM',
       contactId: 'contact-1',
       sessionId: 'session-1',
       requestedDate: '10/04',
@@ -202,9 +208,9 @@ test('inclui o serviço no payload persistido da serviceRequest', () => {
   assert.equal(serviceRequestData.requestedTime, '14:00');
 });
 
-test('usa fallback configurável por projeto quando o Core não traz serviços', () => {
+test('usa fallback configuravel do tenant ativo quando o Core nao traz servicos', () => {
   process.env.BOT_PROJECT_SERVICES_JSON = JSON.stringify({
-    'clinic-project': [
+    'clinica-devtec': [
       { key: 'banho', label: 'Banho' },
       { key: 'tosa', label: 'Tosa' },
     ],
@@ -218,15 +224,16 @@ test('usa fallback configurável por projeto quando o Core não traz serviços',
 
   assert.equal(catalog.source, 'bot_fallback_env');
   assert.equal(catalog.usedFallback, true);
+  assert.equal(catalog.resolvedFrom, 'clinica-devtec');
   assert.deepEqual(
     catalog.services.map((service) => service.label),
     ['Banho', 'Tosa'],
   );
 });
 
-test('prioriza o tenant atual ao carregar fallback de serviços', () => {
+test('mantem fallback preso ao tenant ativo mesmo se outro tenant for informado', () => {
   process.env.BOT_PROJECT_SERVICES_JSON = JSON.stringify({
-    'clinic-project': [
+    'petshop-demo': [
       { key: 'banho', label: 'Banho' },
       { key: 'tosa', label: 'Tosa' },
     ],
@@ -244,7 +251,7 @@ test('prioriza o tenant atual ao carregar fallback de serviços', () => {
       name: 'Projeto com fallback compartilhado',
     },
     {
-      tenantSlug: 'clinica-devtec',
+      tenantSlug: 'petshop-demo',
     },
   );
 
@@ -297,6 +304,15 @@ test('carrega serviços reais do tenant pelo botDb antes do fallback legado', as
       label: 'Procedimento',
       active: true,
       order: 3,
+    },
+    {
+      id: 'barbearia-premium-corte',
+      projectId: 'core-project-barbearia-premium',
+      tenantSlug: 'barbearia-premium',
+      key: 'corte',
+      label: 'Corte',
+      active: true,
+      order: 1,
     },
   ];
 
@@ -360,6 +376,62 @@ test('carrega serviços reais do tenant pelo botDb antes do fallback legado', as
   }
 });
 
+test('nao aplica fallback quando o botDb responde sem servicos ativos para o tenant', async () => {
+  const firebaseAdminModulePath = require.resolve('../lib/firebase-admin');
+  const previousFirebaseAdminModule = require.cache[firebaseAdminModulePath];
+  process.env.BOT_PROJECT_SERVICES_JSON = JSON.stringify({
+    'clinica-devtec': [{ key: 'consulta', label: 'Consulta' }],
+  });
+
+  require.cache[firebaseAdminModulePath] = {
+    id: firebaseAdminModulePath,
+    filename: firebaseAdminModulePath,
+    loaded: true,
+    exports: {
+      getFirestoreClients: () => ({
+        firebaseProjectId: 'bot-whatsapp-ai-d10ef',
+        botDb: {
+          collection: (collectionName) => {
+            assert.equal(collectionName, 'services');
+
+            return {
+              where: (field, operator, value) => {
+                assert.equal(field, 'tenantSlug');
+                assert.equal(operator, '==');
+                assert.equal(value, 'clinica-devtec');
+
+                return {
+                  get: async () => ({
+                    docs: [],
+                  }),
+                };
+              },
+            };
+          },
+        },
+      }),
+    },
+  };
+
+  try {
+    const catalog = await loadRuntimeProjectServices({
+      id: 'core-project-clinica-devtec',
+      slug: 'clinica-devtec',
+    });
+
+    assert.equal(catalog.source, 'bot_firestore_services');
+    assert.equal(catalog.tenantSlug, 'clinica-devtec');
+    assert.equal(catalog.usedFallback, false);
+    assert.deepEqual(catalog.services, []);
+  } finally {
+    if (previousFirebaseAdminModule) {
+      require.cache[firebaseAdminModulePath] = previousFirebaseAdminModule;
+    } else {
+      delete require.cache[firebaseAdminModulePath];
+    }
+  }
+});
+
 test('monta payload de sessão com tenant e serviço selecionado para o botDb', () => {
   const sessionData = buildSessionData({
     sessionKey: 'whatsapp:+5534999991111::whatsapp:+5511999999999',
@@ -367,7 +439,7 @@ test('monta payload de sessão com tenant e serviço selecionado para o botDb', 
     lastInboundText: '1',
     session: {
       step: SESSION_STEPS.AWAITING_NAME,
-      tenantSlug: 'clinica-devtec',
+      tenantSlug: 'barbearia-premium',
       data: {
         selectedServiceKey: 'consulta_avaliacao',
         selectedServiceLabel: 'Consulta de avaliação',
@@ -376,7 +448,7 @@ test('monta payload de sessão com tenant e serviço selecionado para o botDb', 
         from: 'whatsapp:+5534999991111',
         to: 'whatsapp:+5511999999999',
         projectId: 'core-project-clinica-devtec',
-        tenantSlug: 'clinica-devtec',
+        tenantSlug: 'barbearia-premium',
         devMode: true,
         projectOverrideUsed: true,
       },

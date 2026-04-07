@@ -35,7 +35,6 @@ const { handleDevCommand } = require('../lib/dev/commands');
 const {
   clearSessionProjectOverride,
   getSessionProjectOverride,
-  normalizeTenantSlug,
   setSessionProjectOverride,
 } = require('../lib/dev/projectOverride');
 const {
@@ -58,6 +57,7 @@ const {
   isBotProfileInactive,
 } = require('../lib/core/botProfiles');
 const { resolveProjectForConversation } = require('../lib/routing/resolveProject');
+const { ACTIVE_TENANT_SLUG } = require('../lib/tenant');
 
 const SESSION_STEPS = {
   MENU: 'menu',
@@ -73,8 +73,8 @@ const SESSION_STEPS = {
 // mantendo o bot como canal de entrada para solicitacoes.
 // A confirmacao final do agendamento continua acontecendo fora deste bot,
 // pela equipe ou pelos fluxos posteriores do ecossistema.
-// Como o bot agora e multi-tenant por numero de destino, a sessao fica
-// isolada por origem + canal recebido, evitando mistura entre projetos.
+// Nesta fase o bot opera apenas com o tenant piloto. A sessao continua isolada
+// por origem + canal recebido, mas todo o fluxo persiste tenantSlug fixo.
 const sessions = {};
 
 function normalizeSessionIdentifier(value) {
@@ -90,10 +90,7 @@ function buildSessionContext(from, routingContext) {
     from: String(from || '').trim(),
     to: routingContext?.to || null,
     projectId: routingContext?.project?.id || null,
-    tenantSlug:
-      normalizeTenantSlug(
-        routingContext?.tenantSlug || routingContext?.project?.tenantSlug || routingContext?.project?.slug,
-      ) || null,
+    tenantSlug: ACTIVE_TENANT_SLUG,
     connectionId: routingContext?.connection?.id || null,
     connectionIdentifier: routingContext?.connection?.identifier || routingContext?.to || null,
     botProfile: routingContext?.botProfile || null,
@@ -107,10 +104,7 @@ function buildSessionContext(from, routingContext) {
 }
 
 function createInitialSession(context = {}, projectOverride = null) {
-  const tenantSlug =
-    normalizeTenantSlug(
-      context.tenantSlug || projectOverride?.tenantSlug || projectOverride?.projectSlug,
-    ) || null;
+  const tenantSlug = ACTIVE_TENANT_SLUG;
 
   return {
     step: SESSION_STEPS.MENU,
@@ -220,10 +214,7 @@ function ensureSession(sessionKey, context = {}) {
       context: sessions[sessionKey].context,
     });
   } else if (Object.keys(context).length > 0) {
-    const contextTenantSlug =
-      Object.prototype.hasOwnProperty.call(context, 'tenantSlug')
-        ? normalizeTenantSlug(context.tenantSlug)
-        : sessions[sessionKey].tenantSlug || null;
+    const contextTenantSlug = ACTIVE_TENANT_SLUG;
 
     sessions[sessionKey].tenantSlug = contextTenantSlug;
     sessions[sessionKey].context = {
@@ -308,14 +299,7 @@ function closeSession(sessionKey, context = {}) {
 }
 
 async function resolveProjectServices(routingContext, options = {}) {
-  const tenantSlug =
-    normalizeTenantSlug(
-      options.session?.tenantSlug ||
-        options.tenantSlug ||
-        routingContext?.tenantSlug ||
-        routingContext?.project?.tenantSlug ||
-        routingContext?.project?.slug,
-    ) || null;
+  const tenantSlug = ACTIVE_TENANT_SLUG;
   const serviceCatalog = await loadRuntimeProjectServices(routingContext?.project || null, {
     tenantSlug,
   });
@@ -328,6 +312,7 @@ async function resolveProjectServices(routingContext, options = {}) {
     console.log('[services] Servicos carregados para o fluxo de agendamento:', {
       projectId: routingContext?.project?.id || null,
       projectSlug: routingContext?.project?.slug || null,
+      activeTenantSlug: tenantSlug,
       tenantSlug,
       firebaseProjectId: serviceCatalog.firebaseProjectId || null,
       source: serviceCatalog.source,
@@ -383,13 +368,7 @@ ${serviceCatalog.services.map((service, index) => `${index + 1} - ${service.labe
 async function submitAppointmentRequest(sessionKey, from, session, routingContext) {
   const selectedService = getSelectedServiceFromSession(session);
   const sessionId = buildSessionDocumentId(sessionKey);
-  const tenantSlug =
-    normalizeTenantSlug(
-      session?.tenantSlug ||
-        routingContext?.tenantSlug ||
-        routingContext?.project?.tenantSlug ||
-        routingContext?.project?.slug,
-    ) || null;
+  const tenantSlug = ACTIVE_TENANT_SLUG;
 
   try {
     console.log('[core] Iniciando persistencia oficial da solicitacao:', {
@@ -481,6 +460,7 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
     console.warn('[services] Fluxo de agendamento sem servicos disponiveis.', {
       sessionKey,
       projectId: routingContext?.project?.id || null,
+      tenantSlug: ACTIVE_TENANT_SLUG,
     });
     return getServiceUnavailableMessage(routingContext.botProfile);
   }
@@ -490,6 +470,7 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
       sessionKey,
       step: session.step,
       projectId: routingContext?.project?.id || null,
+      tenantSlug: ACTIVE_TENANT_SLUG,
     });
     return await startScheduling(sessionKey, buildSessionContext(from, routingContext), routingContext);
   }
@@ -503,7 +484,7 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
       console.warn('[services] Servico invalido informado pelo usuario.', {
         sessionKey,
         projectId: routingContext?.project?.id || null,
-        tenantSlug: session?.tenantSlug || routingContext?.tenantSlug || null,
+        tenantSlug: ACTIVE_TENANT_SLUG,
         input: cleanedMessage,
         code: serviceSelection.code,
       });
@@ -517,7 +498,7 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
     console.log('[services] Servico selecionado na sessao:', {
       sessionKey,
       projectId: routingContext?.project?.id || null,
-      tenantSlug: session?.tenantSlug || routingContext?.tenantSlug || null,
+      tenantSlug: ACTIVE_TENANT_SLUG,
       serviceKey: session.data.selectedServiceKey,
       serviceLabel: session.data.selectedServiceLabel,
     });
@@ -713,9 +694,10 @@ async function handler(req, res) {
   console.log('[webhook] Número do remetente:', from);
   console.log('[webhook] Número de destino:', to);
   console.log('[webhook] Mensagem recebida:', mensagemRecebida);
+  console.log(`[bot] activeTenant=${ACTIVE_TENANT_SLUG}`);
 
-  // O `/dev` existe apenas para teste/demo no WhatsApp Sandbox, onde um unico
-  // numero precisa alternar tenants sem mudar o roteamento oficial do bot.
+  // O `/dev` existe apenas para teste/demo no WhatsApp Sandbox. Nesta fase,
+  // ele aceita somente o tenant piloto clinica-devtec.
   const devCommandResult = await handleDevCommand({
     from,
     messageText: mensagemRecebida,
@@ -737,17 +719,12 @@ async function handler(req, res) {
     const session = ensureSession(sessionKey, {
       from,
       to: String(to || '').trim().toLowerCase() || null,
+      tenantSlug: ACTIVE_TENANT_SLUG,
     });
 
     if (devCommandResult.action === 'set_project' && devCommandResult.project) {
       const projectOverride = setSessionProjectOverride(session, devCommandResult.project);
-      const tenantSlug =
-        normalizeTenantSlug(
-          projectOverride?.tenantSlug ||
-            devCommandResult.project?.tenantSlug ||
-            devCommandResult.project?.slug ||
-            devCommandResult.resolution?.resolvedSlug,
-        ) || null;
+      const tenantSlug = ACTIVE_TENANT_SLUG;
 
       resetSession(
         sessionKey,
@@ -770,6 +747,7 @@ async function handler(req, res) {
         sessionKey,
         projectId: projectOverride?.projectId || null,
         projectSlug: projectOverride?.projectSlug || null,
+        tenantSlug,
         projectName: projectOverride?.projectName || null,
         matchedBy: devCommandResult.resolution?.matchedBy || null,
       });
@@ -782,7 +760,7 @@ async function handler(req, res) {
         {
           from,
           to: String(to || '').trim().toLowerCase() || null,
-          tenantSlug: null,
+          tenantSlug: ACTIVE_TENANT_SLUG,
           devMode: false,
           projectOverrideUsed: false,
           routingSource: 'incoming_number',
@@ -796,6 +774,7 @@ async function handler(req, res) {
         sessionKey,
         previousProjectId: previousOverride?.projectId || null,
         previousProjectSlug: previousOverride?.projectSlug || null,
+        activeTenantSlug: ACTIVE_TENANT_SLUG,
       });
       await persistSessionState(sessionKey, { lastInboundText: mensagemRecebida });
     } else if (devCommandResult.action === 'invalid_project') {
@@ -825,6 +804,7 @@ async function handler(req, res) {
       from,
       to,
       sessionKey,
+      activeTenantSlug: ACTIVE_TENANT_SLUG,
       hasProjectOverride: Boolean(getSessionProjectOverride(sessions[sessionKey])),
     });
 
@@ -840,12 +820,16 @@ async function handler(req, res) {
       message: error.message,
       connectionId: error.connectionId || null,
       projectId: error.projectId || null,
+      activeTenantSlug: ACTIVE_TENANT_SLUG,
     });
 
     await logProjectRoutingFailure({
       phone: from,
       to,
       error,
+      metadata: {
+        activeTenantSlug: ACTIVE_TENANT_SLUG,
+      },
     });
 
     const unavailableTwiml = new twilio.twiml.MessagingResponse();
@@ -866,6 +850,7 @@ async function handler(req, res) {
       code: error.code || null,
       message: error.message,
       botProfileId: error.botProfileId || null,
+      activeTenantSlug: ACTIVE_TENANT_SLUG,
     });
 
     await logBotProfileResolutionFailure({
@@ -876,6 +861,7 @@ async function handler(req, res) {
       error,
       metadata: {
         connectionId: routingContext.connection?.id || null,
+        activeTenantSlug: ACTIVE_TENANT_SLUG,
       },
     });
 
@@ -891,7 +877,8 @@ async function handler(req, res) {
     from,
     to: routingContext.to,
     projectId: routingContext.project.id,
-    tenantSlug: routingContext.tenantSlug || null,
+    tenantSlug: ACTIVE_TENANT_SLUG,
+    activeTenantSlug: ACTIVE_TENANT_SLUG,
     connectionId: routingContext.connection?.id || null,
     routingSource: routingContext.routingSource || null,
     devMode: routingContext.devMode || false,

@@ -21,11 +21,16 @@ se `BOT_FIREBASE_ALLOW_UNEXPECTED_PROJECT=true` for definido explicitamente.
 
 ## Fluxo piloto
 
-1. Envie `/dev clinica-devtec` no WhatsApp Sandbox.
-2. O runtime grava `session.tenantSlug=clinica-devtec` em `botDb/sessions`.
-3. Ao iniciar agendamento, os servicos ativos sao lidos de `botDb/services`.
+O runtime opera temporariamente com um unico tenant ativo: `clinica-devtec`.
+O comando `/dev clinica-devtec` continua aceito no WhatsApp Sandbox, mas outros
+slugs sao rejeitados nesta fase.
+
+1. Envie `/dev clinica-devtec` no WhatsApp Sandbox, se precisar reiniciar o contexto dev.
+2. O runtime grava sempre `session.tenantSlug=clinica-devtec` em `botDb/sessions`.
+3. Ao iniciar agendamento, os servicos ativos sao lidos de `botDb/services`
+   filtrando somente `tenantSlug=clinica-devtec`.
 4. Ao confirmar, o runtime cria `serviceRequests` em `bot-whatsapp-ai-d10ef`
-   com `tenantSlug`, `service.key` e `service.label`.
+   com `tenantSlug=clinica-devtec`, `service.key` e `service.label`.
 5. O core segue responsavel por integrar o appointment operacional em
    `agendamento-ai-9fbfb`.
 
