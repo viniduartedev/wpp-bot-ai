@@ -3,7 +3,8 @@ const assert = require('node:assert/strict');
 
 const webhookHandler = require('../api/webhook');
 const { buildServiceRequestData } = require('../lib/core/serviceRequests');
-const { loadProjectServices } = require('../lib/bot/services');
+const { loadProjectServices, loadRuntimeProjectServices } = require('../lib/bot/services');
+const { buildSessionData } = require('../lib/core/sessions');
 const { parseDevCommand } = require('../lib/dev/commands');
 const { setSessionProjectOverride } = require('../lib/dev/projectOverride');
 
@@ -61,12 +62,12 @@ test.after(() => {
   delete process.env.BOT_PROJECT_SERVICES_JSON;
 });
 
-test('inicia agendamento pedindo a escolha do serviço', () => {
+test('inicia agendamento pedindo a escolha do serviço', async () => {
   const from = 'whatsapp:+5534999991111';
   const routingContext = buildRoutingContext();
   const sessionKey = buildSessionKey(from, routingContext.to);
 
-  const response = startScheduling(
+  const response = await startScheduling(
     sessionKey,
     buildSessionContext(from, routingContext),
     routingContext,
@@ -83,13 +84,28 @@ test('trata escolha inválida de serviço sem quebrar o fluxo', async () => {
   const routingContext = buildRoutingContext();
   const sessionKey = buildSessionKey(from, routingContext.to);
 
-  startScheduling(sessionKey, buildSessionContext(from, routingContext), routingContext);
+  await startScheduling(sessionKey, buildSessionContext(from, routingContext), routingContext);
 
   const response = await handleSchedulingFlow(sessionKey, from, routingContext, '99');
 
   assert.match(response, /Não consegui identificar a opção escolhida/);
   assert.match(response, /1 - Consulta/);
   assert.equal(sessions[sessionKey].step, SESSION_STEPS.AWAITING_SERVICE);
+});
+
+test('exige número da opção ao selecionar serviço pelo WhatsApp', async () => {
+  const from = 'whatsapp:+5534999991111';
+  const routingContext = buildRoutingContext();
+  const sessionKey = buildSessionKey(from, routingContext.to);
+
+  await startScheduling(sessionKey, buildSessionContext(from, routingContext), routingContext);
+
+  const response = await handleSchedulingFlow(sessionKey, from, routingContext, 'Consulta');
+
+  assert.match(response, /Não consegui identificar a opção escolhida/);
+  assert.equal(sessions[sessionKey].step, SESSION_STEPS.AWAITING_SERVICE);
+  assert.equal(sessions[sessionKey].data.selectedServiceKey, '');
+  assert.equal(sessions[sessionKey].data.selectedServiceLabel, '');
 });
 
 test('normaliza o tenant informado no comando /dev', () => {
@@ -134,7 +150,7 @@ test('inclui o serviço selecionado no resumo final do fluxo', async () => {
   const routingContext = buildRoutingContext();
   const sessionKey = buildSessionKey(from, routingContext.to);
 
-  startScheduling(sessionKey, buildSessionContext(from, routingContext), routingContext);
+  await startScheduling(sessionKey, buildSessionContext(from, routingContext), routingContext);
 
   const serviceResponse = await handleSchedulingFlow(sessionKey, from, routingContext, '1');
   assert.match(serviceResponse, /Perfeito, você escolheu: Consulta/);
@@ -163,6 +179,7 @@ test('inclui o serviço no payload persistido da serviceRequest', () => {
       projectId: 'clinic-project',
       tenantSlug: 'CLINICA-DEVTEC',
       contactId: 'contact-1',
+      sessionId: 'session-1',
       requestedDate: '10/04',
       requestedTime: '14:00',
       service: {
@@ -179,6 +196,7 @@ test('inclui o serviço no payload persistido da serviceRequest', () => {
     key: 'consulta',
     label: 'Consulta',
   });
+  assert.equal(serviceRequestData.sessionId, 'session-1');
   assert.equal(serviceRequestData.tenantSlug, 'clinica-devtec');
   assert.equal(serviceRequestData.requestedDate, '10/04');
   assert.equal(serviceRequestData.requestedTime, '14:00');
@@ -237,4 +255,138 @@ test('prioriza o tenant atual ao carregar fallback de serviços', () => {
     catalog.services.map((service) => service.key),
     ['consulta', 'retorno', 'exame'],
   );
+});
+
+test('carrega serviços reais do tenant pelo botDb antes do fallback legado', async () => {
+  const firebaseAdminModulePath = require.resolve('../lib/firebase-admin');
+  const previousFirebaseAdminModule = require.cache[firebaseAdminModulePath];
+  const queriedFilters = [];
+  const fakeServices = [
+    {
+      id: 'clinica-devtec-retorno',
+      projectId: 'core-project-clinica-devtec',
+      tenantSlug: 'clinica-devtec',
+      key: 'retorno',
+      label: 'Retorno',
+      active: true,
+      order: 2,
+    },
+    {
+      id: 'clinica-devtec-consulta-avaliacao',
+      projectId: 'core-project-clinica-devtec',
+      tenantSlug: 'clinica-devtec',
+      key: 'consulta_avaliacao',
+      label: 'Consulta de avaliação',
+      active: true,
+      order: 1,
+    },
+    {
+      id: 'clinica-devtec-inativo',
+      projectId: 'core-project-clinica-devtec',
+      tenantSlug: 'clinica-devtec',
+      key: 'inativo',
+      label: 'Inativo',
+      active: false,
+      order: 3,
+    },
+    {
+      id: 'clinica-devtec-procedimento',
+      projectId: 'core-project-clinica-devtec',
+      tenantSlug: 'clinica-devtec',
+      key: 'procedimento',
+      label: 'Procedimento',
+      active: true,
+      order: 3,
+    },
+  ];
+
+  require.cache[firebaseAdminModulePath] = {
+    id: firebaseAdminModulePath,
+    filename: firebaseAdminModulePath,
+    loaded: true,
+    exports: {
+      getFirestoreClients: () => ({
+        firebaseProjectId: 'bot-whatsapp-ai-d10ef',
+        botDb: {
+          collection: (collectionName) => {
+            assert.equal(collectionName, 'services');
+
+            return {
+              where: (field, operator, value) => {
+                queriedFilters.push({ field, operator, value });
+
+                return {
+                  get: async () => ({
+                    docs: fakeServices.map((service) => ({
+                      id: service.id,
+                      data: () => service,
+                    })),
+                  }),
+                };
+              },
+            };
+          },
+        },
+      }),
+    },
+  };
+
+  try {
+    const catalog = await loadRuntimeProjectServices(
+      {
+        id: 'core-project-clinica-devtec',
+        slug: 'clinica-devtec',
+      },
+      {
+        tenantSlug: 'clinica-devtec',
+      },
+    );
+
+    assert.equal(catalog.source, 'bot_firestore_services');
+    assert.equal(catalog.firebaseProjectId, 'bot-whatsapp-ai-d10ef');
+    assert.deepEqual(queriedFilters, [
+      { field: 'tenantSlug', operator: '==', value: 'clinica-devtec' },
+    ]);
+    assert.deepEqual(
+      catalog.services.map((service) => service.key),
+      ['consulta_avaliacao', 'retorno', 'procedimento'],
+    );
+  } finally {
+    if (previousFirebaseAdminModule) {
+      require.cache[firebaseAdminModulePath] = previousFirebaseAdminModule;
+    } else {
+      delete require.cache[firebaseAdminModulePath];
+    }
+  }
+});
+
+test('monta payload de sessão com tenant e serviço selecionado para o botDb', () => {
+  const sessionData = buildSessionData({
+    sessionKey: 'whatsapp:+5534999991111::whatsapp:+5511999999999',
+    status: 'active',
+    lastInboundText: '1',
+    session: {
+      step: SESSION_STEPS.AWAITING_NAME,
+      tenantSlug: 'clinica-devtec',
+      data: {
+        selectedServiceKey: 'consulta_avaliacao',
+        selectedServiceLabel: 'Consulta de avaliação',
+      },
+      context: {
+        from: 'whatsapp:+5534999991111',
+        to: 'whatsapp:+5511999999999',
+        projectId: 'core-project-clinica-devtec',
+        tenantSlug: 'clinica-devtec',
+        devMode: true,
+        projectOverrideUsed: true,
+      },
+    },
+  });
+
+  assert.equal(sessionData.projectId, 'core-project-clinica-devtec');
+  assert.equal(sessionData.tenantSlug, 'clinica-devtec');
+  assert.equal(sessionData.currentStep, SESSION_STEPS.AWAITING_NAME);
+  assert.equal(sessionData.selectedServiceKey, 'consulta_avaliacao');
+  assert.equal(sessionData.selectedServiceLabel, 'Consulta de avaliação');
+  assert.equal(sessionData.lastInboundText, '1');
 });

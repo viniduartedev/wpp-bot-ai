@@ -27,7 +27,7 @@ const {
   resolveMenuOptionKey,
 } = require('../lib/bot/profile');
 const {
-  loadProjectServices,
+  loadRuntimeProjectServices,
   normalizeSelectedService,
   resolveServiceSelection,
 } = require('../lib/bot/services');
@@ -49,6 +49,10 @@ const {
   logAppointmentRegistrationFailure,
   registerAppointmentServiceRequest,
 } = require('../lib/core/intake');
+const {
+  buildSessionDocumentId,
+  upsertBotSession,
+} = require('../lib/core/sessions');
 const {
   getBotProfileByProject,
   isBotProfileInactive,
@@ -180,6 +184,32 @@ function logCurrentSession(sessionKey) {
   });
 }
 
+async function persistSessionState(sessionKey, options = {}) {
+  const session = sessions[sessionKey];
+
+  if (!session) {
+    return null;
+  }
+
+  try {
+    return await upsertBotSession({
+      sessionKey,
+      session,
+      status: options.status || 'active',
+      lastInboundText: options.lastInboundText ?? null,
+    });
+  } catch (error) {
+    console.error('[bot-runtime] sessionPersistFailed', {
+      sessionKey,
+      tenantSlug: session.tenantSlug || null,
+      currentStep: session.step || null,
+      message: error.message,
+      code: error.code || null,
+    });
+    return null;
+  }
+}
+
 function ensureSession(sessionKey, context = {}) {
   if (!sessions[sessionKey]) {
     sessions[sessionKey] = createInitialSession(context);
@@ -277,7 +307,7 @@ function closeSession(sessionKey, context = {}) {
   });
 }
 
-function resolveProjectServices(routingContext, options = {}) {
+async function resolveProjectServices(routingContext, options = {}) {
   const tenantSlug =
     normalizeTenantSlug(
       options.session?.tenantSlug ||
@@ -286,17 +316,20 @@ function resolveProjectServices(routingContext, options = {}) {
         routingContext?.project?.tenantSlug ||
         routingContext?.project?.slug,
     ) || null;
-  const serviceCatalog = loadProjectServices(routingContext?.project || null, { tenantSlug });
+  const serviceCatalog = await loadRuntimeProjectServices(routingContext?.project || null, {
+    tenantSlug,
+  });
 
   if (options.log !== false) {
     const serviceKeys = serviceCatalog.services.map((service) => service.key);
 
     console.log(`[bot] servicesLoaded=${serviceCatalog.services.length}`);
-    console.log(`[bot] servicesKeys=[${serviceKeys.join(', ')}]`);
+    console.log(`[bot-runtime] servicesKeys=[${serviceKeys.join(', ')}]`);
     console.log('[services] Servicos carregados para o fluxo de agendamento:', {
       projectId: routingContext?.project?.id || null,
       projectSlug: routingContext?.project?.slug || null,
       tenantSlug,
+      firebaseProjectId: serviceCatalog.firebaseProjectId || null,
       source: serviceCatalog.source,
       resolvedFrom: serviceCatalog.resolvedFrom || null,
       usedFallback: serviceCatalog.usedFallback,
@@ -315,12 +348,13 @@ function getSelectedServiceFromSession(session) {
   });
 }
 
-function startScheduling(sessionKey, context, routingContext) {
+async function startScheduling(sessionKey, context, routingContext) {
   resetSession(sessionKey, context);
   setSessionStep(sessionKey, SESSION_STEPS.AWAITING_SERVICE);
   const session = ensureSession(sessionKey, context);
 
-  const serviceCatalog = resolveProjectServices(routingContext, { session });
+  const serviceCatalog = await resolveProjectServices(routingContext, { session });
+  await persistSessionState(sessionKey);
 
   if (serviceCatalog.services.length === 0) {
     return getServiceUnavailableMessage(context.botProfile || null);
@@ -329,12 +363,13 @@ function startScheduling(sessionKey, context, routingContext) {
   return getSchedulingWelcomeMessage(context.botProfile || null, serviceCatalog.services);
 }
 
-function restartScheduling(sessionKey, context, routingContext) {
+async function restartScheduling(sessionKey, context, routingContext) {
   resetSession(sessionKey, context);
   setSessionStep(sessionKey, SESSION_STEPS.AWAITING_SERVICE);
   const session = ensureSession(sessionKey, context);
 
-  const serviceCatalog = resolveProjectServices(routingContext, { session });
+  const serviceCatalog = await resolveProjectServices(routingContext, { session });
+  await persistSessionState(sessionKey);
 
   if (serviceCatalog.services.length === 0) {
     return getServiceUnavailableMessage(context.botProfile || null);
@@ -347,6 +382,7 @@ ${serviceCatalog.services.map((service, index) => `${index + 1} - ${service.labe
 
 async function submitAppointmentRequest(sessionKey, from, session, routingContext) {
   const selectedService = getSelectedServiceFromSession(session);
+  const sessionId = buildSessionDocumentId(sessionKey);
   const tenantSlug =
     normalizeTenantSlug(
       session?.tenantSlug ||
@@ -378,16 +414,19 @@ async function submitAppointmentRequest(sessionKey, from, session, routingContex
       name: session.data.name,
       requestedDate: session.data.date,
       requestedTime: session.data.time,
+      sessionId,
       tenantSlug,
       service: selectedService,
       routingContext,
     });
 
+    console.log(`[bot] serviceRequestCreated=${registrationResult.serviceRequest.id}`);
     console.log('[core] Persistencia oficial concluida:', {
       projectId: registrationResult.project.id,
       tenantSlug: registrationResult.serviceRequest.data.tenantSlug || tenantSlug,
       connectionId: routingContext.connection?.id || null,
       contactId: registrationResult.contact.id,
+      sessionId,
       serviceRequestId: registrationResult.serviceRequest.id,
       phone: from,
       to: routingContext.to,
@@ -396,7 +435,9 @@ async function submitAppointmentRequest(sessionKey, from, session, routingContex
     });
 
     const successMessage = getRequestRegisteredMessage(routingContext.botProfile, session);
+    await persistSessionState(sessionKey, { status: 'service_request_created' });
     closeSession(sessionKey, buildSessionContext(from, routingContext));
+    await persistSessionState(sessionKey);
 
     return successMessage;
   } catch (error) {
@@ -431,7 +472,7 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
   const session = ensureSession(sessionKey, buildSessionContext(from, routingContext));
   const cleanedMessage = String(messageText || '').trim();
   const normalizedMessage = normalizeMessage(messageText);
-  const serviceCatalog = resolveProjectServices(routingContext, {
+  const serviceCatalog = await resolveProjectServices(routingContext, {
     session,
     log: session.step === SESSION_STEPS.AWAITING_SERVICE,
   });
@@ -450,11 +491,13 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
       step: session.step,
       projectId: routingContext?.project?.id || null,
     });
-    return startScheduling(sessionKey, buildSessionContext(from, routingContext), routingContext);
+    return await startScheduling(sessionKey, buildSessionContext(from, routingContext), routingContext);
   }
 
   if (session.step === SESSION_STEPS.AWAITING_SERVICE) {
-    const serviceSelection = resolveServiceSelection(cleanedMessage, serviceCatalog.services);
+    const serviceSelection = resolveServiceSelection(cleanedMessage, serviceCatalog.services, {
+      numberOnly: true,
+    });
 
     if (!serviceSelection.isValid) {
       console.warn('[services] Servico invalido informado pelo usuario.', {
@@ -470,6 +513,7 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
     session.data.selectedServiceKey = serviceSelection.service.key;
     session.data.selectedServiceLabel = serviceSelection.service.label;
 
+    console.log(`[bot] serviceSelected=${session.data.selectedServiceKey}`);
     console.log('[services] Servico selecionado na sessao:', {
       sessionKey,
       projectId: routingContext?.project?.id || null,
@@ -479,6 +523,7 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
     });
 
     setSessionStep(sessionKey, SESSION_STEPS.AWAITING_NAME);
+    await persistSessionState(sessionKey, { lastInboundText: cleanedMessage });
     return getNamePromptMessage(routingContext.botProfile, session.data.selectedServiceLabel);
   }
 
@@ -491,6 +536,7 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
 
     session.data.name = nameResult.value;
     setSessionStep(sessionKey, SESSION_STEPS.AWAITING_DATE);
+    await persistSessionState(sessionKey, { lastInboundText: cleanedMessage });
     return getDatePromptMessage(routingContext.botProfile, session.data.name);
   }
 
@@ -503,6 +549,7 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
 
     session.data.date = dateResult.value;
     setSessionStep(sessionKey, SESSION_STEPS.AWAITING_TIME);
+    await persistSessionState(sessionKey, { lastInboundText: cleanedMessage });
     return getTimePromptMessage(routingContext.botProfile);
   }
 
@@ -515,6 +562,7 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
 
     session.data.time = timeResult.value;
     setSessionStep(sessionKey, SESSION_STEPS.AWAITING_CONFIRMATION);
+    await persistSessionState(sessionKey, { lastInboundText: cleanedMessage });
     return getRequestConfirmationMessage(routingContext.botProfile, session);
   }
 
@@ -524,7 +572,7 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
     }
 
     if (['2', 'corrigir', 'editar', 'nao', 'não'].includes(normalizedMessage)) {
-      return restartScheduling(
+      return await restartScheduling(
         sessionKey,
         buildSessionContext(from, routingContext),
         routingContext,
@@ -560,22 +608,24 @@ async function montarRespostaBot({ sessionKey, from, routingContext, mensagemTex
 
   if (isMenuCommand(textoNormalizado)) {
     resetSession(sessionKey, buildSessionContext(from, routingContext));
+    await persistSessionState(sessionKey, { lastInboundText: mensagemTexto });
     return getWelcomeMenuMessage(botProfile);
   }
 
   if (isGreeting(textoNormalizado) && (!currentSession || currentSession.step === SESSION_STEPS.MENU)) {
     resetSession(sessionKey, buildSessionContext(from, routingContext));
+    await persistSessionState(sessionKey, { lastInboundText: mensagemTexto });
     return getWelcomeMenuMessage(botProfile);
   }
 
   if (currentSession && isSchedulingStep(currentSession.step)) {
-    return handleSchedulingFlow(sessionKey, from, routingContext, mensagemTexto);
+    return await handleSchedulingFlow(sessionKey, from, routingContext, mensagemTexto);
   }
 
   const selectedMenuKey = resolveMenuOptionKey(textoNormalizado, botProfile);
 
   if (selectedMenuKey === 'schedule') {
-    return startScheduling(sessionKey, buildSessionContext(from, routingContext), routingContext);
+    return await startScheduling(sessionKey, buildSessionContext(from, routingContext), routingContext);
   }
 
   if (selectedMenuKey === 'hours') {
@@ -588,6 +638,7 @@ async function montarRespostaBot({ sessionKey, from, routingContext, mensagemTex
 
   if (selectedMenuKey === 'human') {
     resetSession(sessionKey, buildSessionContext(from, routingContext));
+    await persistSessionState(sessionKey, { lastInboundText: mensagemTexto });
     return getTalkToTeamMessage(botProfile);
   }
 
@@ -722,6 +773,7 @@ async function handler(req, res) {
         projectName: projectOverride?.projectName || null,
         matchedBy: devCommandResult.resolution?.matchedBy || null,
       });
+      await persistSessionState(sessionKey, { lastInboundText: mensagemRecebida });
     } else if (devCommandResult.action === 'reset') {
       const previousOverride = clearSessionProjectOverride(session);
 
@@ -745,6 +797,7 @@ async function handler(req, res) {
         previousProjectId: previousOverride?.projectId || null,
         previousProjectSlug: previousOverride?.projectSlug || null,
       });
+      await persistSessionState(sessionKey, { lastInboundText: mensagemRecebida });
     } else if (devCommandResult.action === 'invalid_project') {
       console.warn('[dev] Tentativa de override invalida:', {
         from,
