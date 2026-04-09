@@ -746,6 +746,12 @@ async function handler(req, res) {
       );
 
       console.log(`[bot] tenantSelected=${tenantSlug || 'null'}`);
+      console.log(`[dev] tenantForced=${ACTIVE_TENANT_SLUG}`, {
+        from,
+        to,
+        sessionKey,
+        action: devCommandResult.action,
+      });
       console.log('[dev] Override de projeto ativado:', {
         from,
         to,
@@ -780,6 +786,16 @@ async function handler(req, res) {
         previousProjectId: previousOverride?.projectId || null,
         previousProjectSlug: previousOverride?.projectSlug || null,
         activeTenantSlug: ACTIVE_TENANT_SLUG,
+      });
+      console.log('[dev] resetApplied', {
+        sessionKey,
+        from,
+        to,
+        tenantSlug: ACTIVE_TENANT_SLUG,
+        currentStep: sessions[sessionKey]?.step || null,
+        selectedServiceKey: sessions[sessionKey]?.data?.selectedServiceKey || '',
+        selectedServiceLabel: sessions[sessionKey]?.data?.selectedServiceLabel || '',
+        pendingConversationStateCleared: true,
       });
       await persistSessionState(sessionKey, { lastInboundText: mensagemRecebida });
     } else if (devCommandResult.action === 'invalid_project') {
