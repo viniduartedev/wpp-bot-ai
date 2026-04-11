@@ -126,6 +126,67 @@ function getSessionProjectId(session) {
   );
 }
 
+function logContextResolution(label, value, metadata = {}) {
+  console.log(`[bot][context] ${label}=${value ?? 'null'}`, metadata);
+}
+
+function logMissingContextLink(reason, metadata = {}) {
+  console.warn(`[bot][context] missingLink reason=${reason}`, metadata);
+}
+
+function getSessionRoutingReuseDecision(session, to) {
+  const projectId = getSessionProjectId(session);
+  const connectionId = session?.context?.connectionId || null;
+  const projectOverrideActive = Boolean(getSessionProjectOverride(session));
+  const sessionTo = normalizeSessionIdentifier(session?.context?.to || '');
+  const currentTo = normalizeSessionIdentifier(to);
+
+  if (!projectId) {
+    return {
+      canReuse: false,
+      reason: 'session_missing_projectId',
+      projectId: null,
+      connectionId,
+    };
+  }
+
+  if (projectOverrideActive) {
+    return {
+      canReuse: true,
+      reason: 'session_override_active',
+      projectId,
+      connectionId,
+    };
+  }
+
+  if (!connectionId) {
+    return {
+      canReuse: false,
+      reason: 'session_missing_connectionId',
+      projectId,
+      connectionId: null,
+    };
+  }
+
+  if (sessionTo && currentTo && sessionTo !== currentTo) {
+    return {
+      canReuse: false,
+      reason: 'session_destination_mismatch',
+      projectId,
+      connectionId,
+      sessionTo,
+      currentTo,
+    };
+  }
+
+  return {
+    canReuse: true,
+    reason: 'session_context_complete',
+    projectId,
+    connectionId,
+  };
+}
+
 function getStepLogName(step) {
   if (step === SESSION_STEPS.AWAITING_NAME) {
     return 'AWAITING_CUSTOMER_NAME';
@@ -504,6 +565,50 @@ async function resolveRoutingContextFromSession({
   });
 
   return routingContext;
+}
+
+function logResolvedRoutingContext(sessionKey, from, to, routingContext) {
+  logContextResolution('tenantResolved', routingContext?.tenantSlug || ACTIVE_TENANT_SLUG, {
+    sessionKey,
+    from,
+    to: routingContext?.to || String(to || '').trim().toLowerCase() || null,
+    routingSource: routingContext?.routingSource || null,
+  });
+  logContextResolution('connectionResolved', routingContext?.connection?.id || null, {
+    sessionKey,
+    from,
+    to: routingContext?.to || String(to || '').trim().toLowerCase() || null,
+    connectionIdentifier: routingContext?.connection?.identifier || routingContext?.to || null,
+    routingSource: routingContext?.routingSource || null,
+  });
+  logContextResolution('projectResolved', routingContext?.project?.id || null, {
+    sessionKey,
+    from,
+    to: routingContext?.to || String(to || '').trim().toLowerCase() || null,
+    tenantSlug: routingContext?.tenantSlug || ACTIVE_TENANT_SLUG,
+    routingSource: routingContext?.routingSource || null,
+  });
+}
+
+function logResolvedBotProfile(sessionKey, from, to, routingContext) {
+  logContextResolution('botProfileResolved', routingContext?.botProfile?.id || null, {
+    sessionKey,
+    from,
+    to: routingContext?.to || String(to || '').trim().toLowerCase() || null,
+    projectId: routingContext?.project?.id || null,
+    botProfileSource: routingContext?.botProfile?.source || null,
+  });
+  logContextResolution(
+    'botProfileFallbackUsed',
+    routingContext?.botProfile?.fallbackUsed === true,
+    {
+      sessionKey,
+      from,
+      to: routingContext?.to || String(to || '').trim().toLowerCase() || null,
+      projectId: routingContext?.project?.id || null,
+      botProfileId: routingContext?.botProfile?.id || null,
+    },
+  );
 }
 
 async function resolveProjectServices(routingContext, options = {}) {
@@ -1181,7 +1286,22 @@ async function handler(req, res) {
   });
 
   let routingContext;
-  const shouldReuseSessionRouting = Boolean(getSessionProjectId(loadedSession));
+  const sessionRoutingReuseDecision = getSessionRoutingReuseDecision(loadedSession, to);
+  const shouldReuseSessionRouting = sessionRoutingReuseDecision.canReuse;
+
+  if (!shouldReuseSessionRouting) {
+    logMissingContextLink(sessionRoutingReuseDecision.reason, {
+      sessionKey,
+      from,
+      to,
+      currentStep: loadedSession?.step || null,
+      projectId: sessionRoutingReuseDecision.projectId || null,
+      connectionId: sessionRoutingReuseDecision.connectionId || null,
+      routingSource: loadedSession?.context?.routingSource || null,
+      sessionTo: sessionRoutingReuseDecision.sessionTo || null,
+      currentTo: sessionRoutingReuseDecision.currentTo || null,
+    });
+  }
 
   if (shouldReuseSessionRouting) {
     try {
@@ -1256,6 +1376,8 @@ async function handler(req, res) {
     }
   }
 
+  logResolvedRoutingContext(sessionKey, from, to, routingContext);
+
   try {
     const botProfile = await resolveBotProfileContext(from, to, routingContext);
     routingContext.botProfile = botProfile;
@@ -1288,6 +1410,8 @@ async function handler(req, res) {
     res.setHeader('Content-Type', 'text/xml');
     return res.status(200).send(unavailableTwiml.toString());
   }
+
+  logResolvedBotProfile(sessionKey, from, to, routingContext);
 
   console.log('[routing] Contexto resolvido para a conversa:', {
     sessionKey,

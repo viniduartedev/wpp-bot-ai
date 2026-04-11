@@ -941,6 +941,122 @@ test('rehidrata a sessão do Firestore e persiste inboundEvents, session e servi
   });
 });
 
+test('reidrata sessão parcial e refaz o routing por incoming_number para preencher connectionId e botProfileId', async () => {
+  const from = 'whatsapp:+553496794527';
+  const to = 'whatsapp:+14155238886';
+  const sessionKey = buildSessionKey(from, to);
+  const sessionId = buildSessionDocumentId(sessionKey);
+  const { firestoreStore } = setFirebaseAdminMock({
+    initialBotCollections: {
+      projectConnections: {
+        'connection-1': {
+          connectionType: 'whatsapp',
+          provider: 'twilio',
+          identifier: to,
+          projectId: 'core-project-clinica-devtec',
+          tenantSlug: 'clinica-devtec',
+          environment: 'dev',
+          active: true,
+        },
+      },
+      projects: {
+        'core-project-clinica-devtec': {
+          slug: 'clinica-devtec',
+          tenantSlug: 'clinica-devtec',
+          name: 'Clínica Devtec',
+          active: true,
+        },
+      },
+      botProfiles: {
+        'core-project-clinica-devtec': {
+          projectId: 'core-project-clinica-devtec',
+          tenantSlug: 'clinica-devtec',
+          assistantName: 'Clara',
+          businessName: 'Clínica Devtec',
+          tone: 'professional',
+          menuOptions: [
+            {
+              key: 'schedule',
+              label: 'Agendar atendimento',
+              enabled: true,
+            },
+            {
+              key: 'hours',
+              label: 'Horário de atendimento',
+              enabled: true,
+            },
+            {
+              key: 'address',
+              label: 'Endereço',
+              enabled: true,
+            },
+            {
+              key: 'human',
+              label: 'Falar com a equipe',
+              enabled: true,
+            },
+          ],
+          closingMessage: 'Nossa equipe vai confirmar os próximos passos em breve.',
+          welcomeMessage:
+            'Olá! Aqui é a Clara, assistente virtual da Clínica Devtec. Posso te ajudar.',
+          active: true,
+        },
+      },
+      sessions: {
+        [sessionId]: {
+          sessionKey,
+          projectId: 'core-project-clinica-devtec',
+          tenantSlug: 'clinica-devtec',
+          channel: 'whatsapp',
+          phone: from,
+          to,
+          status: 'active',
+          currentStep: SESSION_STEPS.MENU,
+          data: {
+            selectedServiceKey: '',
+            selectedServiceLabel: '',
+            name: '',
+            date: '',
+            time: '',
+          },
+          context: {
+            from,
+            to,
+            projectId: 'core-project-clinica-devtec',
+            tenantSlug: 'clinica-devtec',
+            connectionId: null,
+            connectionIdentifier: null,
+            botProfileId: null,
+            botProfileFallbackUsed: false,
+            botProfileSource: null,
+            routingSource: 'incoming_number',
+            devMode: false,
+            projectOverrideUsed: false,
+          },
+        },
+      },
+    },
+  });
+
+  const response = await invokeWebhook({ from, to, body: 'oi' });
+  const sessionDoc = firestoreStore.get('sessions', sessionId);
+
+  assert.match(response.body, /Clara|assistente virtual/i);
+  assert.ok(sessionDoc);
+  assert.equal(sessionDoc.projectId, 'core-project-clinica-devtec');
+  assert.equal(sessionDoc.context.projectId, 'core-project-clinica-devtec');
+  assert.equal(sessionDoc.context.connectionId, 'connection-1');
+  assert.equal(sessionDoc.context.connectionIdentifier, 'whatsapp:+14155238886');
+  assert.equal(sessionDoc.context.botProfileId, 'core-project-clinica-devtec');
+  assert.equal(sessionDoc.context.botProfileSource, 'project');
+  assert.equal(sessionDoc.context.botProfileFallbackUsed, false);
+  assert.equal(sessionDoc.context.routingSource, 'incoming_number');
+  assert.equal(sessions[sessionKey].context.projectId, 'core-project-clinica-devtec');
+  assert.equal(sessions[sessionKey].context.connectionId, 'connection-1');
+  assert.equal(sessions[sessionKey].context.botProfileId, 'core-project-clinica-devtec');
+  assert.equal(sessions[sessionKey].context.botProfile?.id, 'core-project-clinica-devtec');
+});
+
 test('permite que o mesmo número abra mais de uma serviceRequest em momentos diferentes', async () => {
   const from = 'whatsapp:+5534999991111';
   const to = 'whatsapp:+5511999999999';
