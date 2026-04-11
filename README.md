@@ -22,6 +22,50 @@ como fallback temporario. Para evitar uso acidental da agenda operacional, o
 runtime bloqueia qualquer projeto diferente de `bot-whatsapp-ai-d10ef`, exceto
 se `BOT_FIREBASE_ALLOW_UNEXPECTED_PROJECT=true` for definido explicitamente.
 
+## ProjectConnections
+
+O projeto `bot-whatsapp-ai-d10ef` precisa manter dois tipos distintos de
+`projectConnections`:
+
+1. Canal do bot:
+   `connectionType=whatsapp`, `provider=twilio`, `direction=inbound`
+   Esse documento e o que o runtime usa para resolver o canal do WhatsApp.
+   Para o sandbox atual, o documento deve incluir:
+
+```json
+{
+  "tenantSlug": "clinica-devtec",
+  "tenantId": "demo-tenant",
+  "projectId": "core-project-clinica-devtec",
+  "connectionType": "whatsapp",
+  "provider": "twilio",
+  "status": "active",
+  "active": true,
+  "isActive": true,
+  "direction": "inbound",
+  "identifier": "whatsapp:+14155238886",
+  "to": "whatsapp:+14155238886",
+  "environment": "dev",
+  "acceptedEventTypes": ["message"]
+}
+```
+
+2. Integracao operacional:
+   `connectionType=scheduling`, `provider=firebase`, `direction=outbound`
+   Esse documento continua valido para a materializacao do appointment em
+   `agendamento-ai-9fbfb` e nao deve ser removido.
+
+Para sincronizar a conexao de canal do bot sem tocar na conexao operacional,
+use:
+
+```bash
+firebase projects:list
+npm run project-connections:upsert
+```
+
+O script usa a autenticacao ja ativa no Firebase CLI, preserva a conexao
+Firebase/agendamento existente e faz o upsert apenas do documento Twilio.
+
 ## Fluxo piloto
 
 O runtime opera temporariamente com um unico tenant ativo: `clinica-devtec`.
