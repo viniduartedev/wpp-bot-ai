@@ -46,6 +46,23 @@ function loadRoutingWithMocks({
       findWhatsAppConnectionsByTenantSlug: async () => connectionsByTenantSlug,
       isConnectionInactive: (connection) => connection?.active === false,
       normalizeConnectionIdentifier: (value) => String(value || '').trim().toLowerCase(),
+      sanitizeConnectionForLog: (connection, metadata = {}) => ({
+        id: connection?.id || null,
+        tenantSlug: connection?.tenantSlug || null,
+        tenantId: connection?.tenantId || null,
+        status: connection?.status || null,
+        direction: connection?.direction || null,
+        connectionType: connection?.connectionType || null,
+        provider: connection?.provider || null,
+        environment: connection?.environment || null,
+        to: String(connection?.identifier || '').trim().toLowerCase() || null,
+        projectId: connection?.projectId || null,
+        targetProjectId: connection?.targetProjectId || connection?.projectId || null,
+        active: connection?.active !== false,
+        isActive: connection?.isActive !== false,
+        inactiveByRuntimeRule: connection?.active === false,
+        ...metadata,
+      }),
     },
   };
 
