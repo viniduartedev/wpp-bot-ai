@@ -1134,6 +1134,111 @@ test('reidrata o to persistido quando a segunda mensagem chega sem To no payload
   );
 });
 
+test('salva contexto completo na sessão e reidrata sem missingLink na segunda mensagem', async () => {
+  const from = 'whatsapp:+553496794527';
+  const to = 'whatsapp:+14155238886';
+  const sessionKey = buildSessionKey(from, to);
+  const sessionId = buildSessionDocumentId(sessionKey);
+  const { firestoreStore } = setFirebaseAdminMock({
+    initialBotCollections: {
+      projectConnections: {
+        'project-connection-clinica-devtec-whatsapp-dev': {
+          connectionType: 'whatsapp',
+          provider: 'twilio',
+          identifier: to,
+          projectId: 'core-project-clinica-devtec',
+          tenantSlug: 'clinica-devtec',
+          environment: 'dev',
+          active: true,
+        },
+      },
+      projects: {
+        'core-project-clinica-devtec': {
+          slug: 'clinica-devtec',
+          tenantSlug: 'clinica-devtec',
+          name: 'Clínica Devtec',
+          active: true,
+        },
+      },
+      botProfiles: {
+        'core-project-clinica-devtec': {
+          projectId: 'core-project-clinica-devtec',
+          tenantSlug: 'clinica-devtec',
+          assistantName: 'Clara',
+          businessName: 'Clínica Devtec',
+          tone: 'professional',
+          menuOptions: [
+            { key: 'schedule', label: 'Agendar atendimento', enabled: true },
+            { key: 'hours', label: 'Horário de atendimento', enabled: true },
+            { key: 'address', label: 'Endereço', enabled: true },
+            { key: 'human', label: 'Falar com a equipe', enabled: true },
+          ],
+          closingMessage: 'Nossa equipe vai confirmar os próximos passos em breve.',
+          welcomeMessage:
+            'Olá! Aqui é a Clara, assistente virtual da Clínica Devtec. Posso te ajudar.',
+          active: true,
+        },
+      },
+    },
+  });
+
+  const originalWarn = console.warn;
+  const warnCalls = [];
+  console.warn = (...args) => {
+    warnCalls.push(args);
+  };
+
+  try {
+    const firstResponse = await invokeWebhook({ from, to, body: 'oi' });
+    assert.match(firstResponse.body, /Clara|assistente virtual/i);
+
+    const savedSession = firestoreStore.get('sessions', sessionId);
+    assert.ok(savedSession);
+    assert.equal(savedSession.projectId, 'core-project-clinica-devtec');
+    assert.equal(savedSession.tenantSlug, 'clinica-devtec');
+    assert.deepEqual(savedSession.context, {
+      from,
+      to: 'whatsapp:+14155238886',
+      projectId: 'core-project-clinica-devtec',
+      tenantSlug: 'clinica-devtec',
+      connectionId: 'project-connection-clinica-devtec-whatsapp-dev',
+      connectionIdentifier: 'whatsapp:+14155238886',
+      botProfileId: 'core-project-clinica-devtec',
+      botProfileFallbackUsed: false,
+      botProfileSource: 'project',
+      routingSource: 'incoming_number',
+      devMode: false,
+      projectOverrideUsed: false,
+    });
+    const missingLinkCountBeforeSecondMessage = warnCalls.filter((call) =>
+      String(call[0] || '').includes('[bot][context] missingLink reason='),
+    ).length;
+
+    clearSessions();
+
+    const secondResponse = await invokeWebhook({ from, to, body: '1' });
+    assert.match(secondResponse.body, /Qual serviço você deseja\?/i);
+
+    const rehydratedSession = sessions[sessionKey];
+    assert.ok(rehydratedSession);
+    assert.equal(rehydratedSession.context.projectId, 'core-project-clinica-devtec');
+    assert.equal(
+      rehydratedSession.context.connectionId,
+      'project-connection-clinica-devtec-whatsapp-dev',
+    );
+    assert.equal(rehydratedSession.context.botProfileId, 'core-project-clinica-devtec');
+    assert.equal(rehydratedSession.context.botProfileSource, 'project');
+    assert.equal(
+      warnCalls.filter((call) =>
+        String(call[0] || '').includes('[bot][context] missingLink reason='),
+      ).length,
+      missingLinkCountBeforeSecondMessage,
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
 test('permite que o mesmo número abra mais de uma serviceRequest em momentos diferentes', async () => {
   const from = 'whatsapp:+5534999991111';
   const to = 'whatsapp:+5511999999999';

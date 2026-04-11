@@ -544,6 +544,18 @@ async function persistSessionState(sessionKey, options = {}) {
   }
 
   try {
+    console.log('[bot][session] savingContext', {
+      sessionKey,
+      from: session.context?.from || null,
+      to: session.context?.to || null,
+      projectId: session.context?.projectId || null,
+      connectionId: session.context?.connectionId || null,
+      connectionIdentifier: session.context?.connectionIdentifier || null,
+      botProfileId: session.context?.botProfileId || null,
+      botProfileSource: session.context?.botProfileSource || null,
+      tenantSlug: session.context?.tenantSlug || session.tenantSlug || null,
+      currentStep: session.step || null,
+    });
     logContextResolution('persistedTo', session.context?.to || null, {
       sessionKey,
       connectionIdentifier: session.context?.connectionIdentifier || null,
@@ -583,6 +595,18 @@ async function persistSessionState(sessionKey, options = {}) {
 async function loadSessionState(sessionKey, context = {}) {
   if (sessions[sessionKey]) {
     ensureSession(sessionKey, context);
+    console.log('[bot][session] rehydratedContext', {
+      sessionKey,
+      source: 'memory',
+      from: sessions[sessionKey].context?.from || null,
+      to: sessions[sessionKey].context?.to || null,
+      projectId: sessions[sessionKey].context?.projectId || null,
+      connectionId: sessions[sessionKey].context?.connectionId || null,
+      connectionIdentifier: sessions[sessionKey].context?.connectionIdentifier || null,
+      botProfileId: sessions[sessionKey].context?.botProfileId || null,
+      botProfileSource: sessions[sessionKey].context?.botProfileSource || null,
+      tenantSlug: sessions[sessionKey].context?.tenantSlug || null,
+    });
     logContextResolution('rehydratedTo', sessions[sessionKey].context?.to || null, {
       sessionKey,
       source: 'memory',
@@ -603,6 +627,18 @@ async function loadSessionState(sessionKey, context = {}) {
 
     if (!persistedSession) {
       sessions[sessionKey] = createInitialSession(context);
+      console.log('[bot][session] rehydratedContext', {
+        sessionKey,
+        source: 'initialized',
+        from: sessions[sessionKey].context?.from || null,
+        to: sessions[sessionKey].context?.to || null,
+        projectId: sessions[sessionKey].context?.projectId || null,
+        connectionId: sessions[sessionKey].context?.connectionId || null,
+        connectionIdentifier: sessions[sessionKey].context?.connectionIdentifier || null,
+        botProfileId: sessions[sessionKey].context?.botProfileId || null,
+        botProfileSource: sessions[sessionKey].context?.botProfileSource || null,
+        tenantSlug: sessions[sessionKey].context?.tenantSlug || null,
+      });
       logContextResolution('persistedTo', null, {
         sessionKey,
         source: 'initialized',
@@ -628,6 +664,18 @@ async function loadSessionState(sessionKey, context = {}) {
       projectId: persistedSession.data?.context?.projectId || persistedSession.data?.projectId || null,
     });
     sessions[sessionKey] = hydratePersistedSession(persistedSession, context);
+    console.log('[bot][session] rehydratedContext', {
+      sessionKey,
+      source: 'firestore',
+      from: sessions[sessionKey].context?.from || null,
+      to: sessions[sessionKey].context?.to || null,
+      projectId: sessions[sessionKey].context?.projectId || null,
+      connectionId: sessions[sessionKey].context?.connectionId || null,
+      connectionIdentifier: sessions[sessionKey].context?.connectionIdentifier || null,
+      botProfileId: sessions[sessionKey].context?.botProfileId || null,
+      botProfileSource: sessions[sessionKey].context?.botProfileSource || null,
+      tenantSlug: sessions[sessionKey].context?.tenantSlug || null,
+    });
     logContextResolution('rehydratedTo', sessions[sessionKey].context?.to || null, {
       sessionKey,
       source: 'firestore',
@@ -650,6 +698,18 @@ async function loadSessionState(sessionKey, context = {}) {
     });
 
     sessions[sessionKey] = createInitialSession(context);
+    console.log('[bot][session] rehydratedContext', {
+      sessionKey,
+      source: 'initialized_after_error',
+      from: sessions[sessionKey].context?.from || null,
+      to: sessions[sessionKey].context?.to || null,
+      projectId: sessions[sessionKey].context?.projectId || null,
+      connectionId: sessions[sessionKey].context?.connectionId || null,
+      connectionIdentifier: sessions[sessionKey].context?.connectionIdentifier || null,
+      botProfileId: sessions[sessionKey].context?.botProfileId || null,
+      botProfileSource: sessions[sessionKey].context?.botProfileSource || null,
+      tenantSlug: sessions[sessionKey].context?.tenantSlug || null,
+    });
     logFlow('sessionLoaded', {
       sessionKey,
       source: 'initialized_after_error',
