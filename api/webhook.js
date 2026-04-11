@@ -50,6 +50,7 @@ const {
 } = require('../lib/core/intake');
 const {
   buildSessionDocumentId,
+  findBotSessionsByPhone,
   getBotSession,
   upsertBotSession,
 } = require('../lib/core/sessions');
@@ -88,14 +89,222 @@ function buildSessionKey(from, to) {
   return `${normalizeSessionIdentifier(from)}::${normalizeSessionIdentifier(to)}`;
 }
 
+function normalizeChannelAddress(value) {
+  return normalizeSessionIdentifier(value) || null;
+}
+
+function hasContextValue(value) {
+  if (typeof value === 'string') {
+    return value.trim().length > 0;
+  }
+
+  return value !== null && typeof value !== 'undefined';
+}
+
+function pickContextValue(...values) {
+  for (const value of values) {
+    if (hasContextValue(value)) {
+      return typeof value === 'string' ? String(value).trim() : value;
+    }
+  }
+
+  return null;
+}
+
+function extractStoredSessionTo(sessionData = {}) {
+  return normalizeChannelAddress(
+    sessionData?.context?.to ||
+      sessionData?.to ||
+      sessionData?.context?.connectionIdentifier ||
+      null,
+  );
+}
+
+function extractStoredConnectionIdentifier(sessionData = {}) {
+  return normalizeChannelAddress(
+    sessionData?.context?.connectionIdentifier ||
+      sessionData?.context?.to ||
+      sessionData?.to ||
+      null,
+  );
+}
+
+function mergeSessionContext(baseContext = {}, nextContext = {}) {
+  const mergedTo =
+    normalizeChannelAddress(nextContext.to || nextContext.connectionIdentifier) ||
+    normalizeChannelAddress(baseContext.to || baseContext.connectionIdentifier);
+  const mergedConnectionIdentifier =
+    normalizeChannelAddress(nextContext.connectionIdentifier || nextContext.to) ||
+    normalizeChannelAddress(baseContext.connectionIdentifier || baseContext.to);
+
+  return {
+    from: pickContextValue(nextContext.from, baseContext.from, ''),
+    to: mergedTo,
+    projectId: pickContextValue(nextContext.projectId, baseContext.projectId),
+    tenantSlug: ACTIVE_TENANT_SLUG,
+    connectionId: pickContextValue(nextContext.connectionId, baseContext.connectionId),
+    connectionIdentifier: mergedConnectionIdentifier,
+    botProfile: pickContextValue(nextContext.botProfile, baseContext.botProfile),
+    botProfileId: pickContextValue(nextContext.botProfileId, baseContext.botProfileId),
+    botProfileFallbackUsed:
+      typeof nextContext.botProfileFallbackUsed === 'boolean'
+        ? nextContext.botProfileFallbackUsed
+        : typeof baseContext.botProfileFallbackUsed === 'boolean'
+          ? baseContext.botProfileFallbackUsed
+          : false,
+    botProfileSource: pickContextValue(nextContext.botProfileSource, baseContext.botProfileSource),
+    routingSource: pickContextValue(nextContext.routingSource, baseContext.routingSource),
+    devMode:
+      typeof nextContext.devMode === 'boolean'
+        ? nextContext.devMode
+        : typeof baseContext.devMode === 'boolean'
+          ? baseContext.devMode
+          : false,
+    projectOverrideUsed:
+      typeof nextContext.projectOverrideUsed === 'boolean'
+        ? nextContext.projectOverrideUsed
+        : typeof baseContext.projectOverrideUsed === 'boolean'
+          ? baseContext.projectOverrideUsed
+          : false,
+  };
+}
+
+function buildTwilioPayloadLog(body = {}) {
+  return {
+    from: body.From || null,
+    to: body.To || null,
+    messageSid: body.MessageSid || body.SmsMessageSid || null,
+    accountSid: body.AccountSid || null,
+    waId: body.WaId || null,
+    profileName: body.ProfileName || null,
+    bodyLength: String(body.Body || '').length,
+  };
+}
+
+function findSessionCandidateInMemoryByPhone(from) {
+  const normalizedFrom = normalizeSessionIdentifier(from);
+  const matches = Object.entries(sessions).filter(([, session]) => {
+    return normalizeSessionIdentifier(session?.context?.from || '') === normalizedFrom;
+  });
+
+  if (matches.length !== 1) {
+    return null;
+  }
+
+  const [sessionKey, session] = matches[0];
+  const sessionTo =
+    normalizeChannelAddress(session?.context?.to || session?.context?.connectionIdentifier) ||
+    normalizeChannelAddress(sessionKey.split('::')[1] || '');
+
+  if (!sessionTo) {
+    return null;
+  }
+
+  return {
+    sessionKey,
+    to: sessionTo,
+    source: 'memory_session',
+  };
+}
+
+async function findSessionCandidateInFirestoreByPhone(from) {
+  const sessionRecords = await findBotSessionsByPhone(from, { limit: 10 });
+  const candidates = sessionRecords
+    .map((record) => ({
+      sessionId: record.id,
+      sessionKey: String(record.data?.sessionKey || '').trim() || null,
+      to: extractStoredSessionTo(record.data),
+      connectionIdentifier: extractStoredConnectionIdentifier(record.data),
+      projectId: record.data?.context?.projectId || record.data?.projectId || null,
+      connectionId: record.data?.context?.connectionId || null,
+      status: record.data?.status || null,
+    }))
+    .filter((candidate) => candidate.to);
+  const distinctToValues = [...new Set(candidates.map((candidate) => candidate.to))];
+
+  if (distinctToValues.length !== 1) {
+    return {
+      sessionKey: null,
+      to: null,
+      source: null,
+      reason: candidates.length === 0 ? 'phone_lookup_no_to' : 'phone_lookup_ambiguous',
+      candidates,
+    };
+  }
+
+  const selectedTo = distinctToValues[0];
+  const preferredCandidate =
+    candidates.find(
+      (candidate) =>
+        candidate.projectId && (candidate.connectionId || candidate.connectionIdentifier),
+    ) || candidates[0];
+
+  return {
+    sessionKey: preferredCandidate.sessionKey || buildSessionKey(from, selectedTo),
+    to: selectedTo,
+    source: 'persisted_session_phone_lookup',
+    reason: null,
+    candidates,
+  };
+}
+
+async function resolveIncomingAddressing({ from, requestTo }) {
+  const normalizedRequestTo = normalizeChannelAddress(requestTo);
+
+  if (normalizedRequestTo) {
+    return {
+      requestTo: normalizedRequestTo,
+      currentTo: normalizedRequestTo,
+      persistedTo: null,
+      source: 'request',
+      sessionKey: buildSessionKey(from, normalizedRequestTo),
+      candidateReason: null,
+      candidateCount: 0,
+    };
+  }
+
+  const inMemoryCandidate = findSessionCandidateInMemoryByPhone(from);
+
+  if (inMemoryCandidate) {
+    return {
+      requestTo: null,
+      currentTo: inMemoryCandidate.to,
+      persistedTo: inMemoryCandidate.to,
+      source: inMemoryCandidate.source,
+      sessionKey: inMemoryCandidate.sessionKey,
+      candidateReason: null,
+      candidateCount: 1,
+    };
+  }
+
+  const persistedCandidate = await findSessionCandidateInFirestoreByPhone(from);
+
+  return {
+    requestTo: null,
+    currentTo: persistedCandidate.to || null,
+    persistedTo: persistedCandidate.to || null,
+    source: persistedCandidate.source || 'unresolved',
+    sessionKey:
+      persistedCandidate.sessionKey ||
+      buildSessionKey(from, persistedCandidate.to || null),
+    candidateReason: persistedCandidate.reason || null,
+    candidateCount: persistedCandidate.candidates?.length || 0,
+  };
+}
+
 function buildSessionContext(from, routingContext) {
+  const contextTo = normalizeChannelAddress(
+    routingContext?.to || routingContext?.connection?.identifier || null,
+  );
+
   return {
     from: String(from || '').trim(),
-    to: routingContext?.to || null,
+    to: contextTo,
     projectId: routingContext?.project?.id || null,
     tenantSlug: ACTIVE_TENANT_SLUG,
     connectionId: routingContext?.connection?.id || null,
-    connectionIdentifier: routingContext?.connection?.identifier || routingContext?.to || null,
+    connectionIdentifier:
+      normalizeChannelAddress(routingContext?.connection?.identifier || contextTo) || null,
     botProfile: routingContext?.botProfile || null,
     botProfileId: routingContext?.botProfile?.id || null,
     botProfileFallbackUsed: routingContext?.botProfile?.fallbackUsed || false,
@@ -137,9 +346,12 @@ function logMissingContextLink(reason, metadata = {}) {
 function getSessionRoutingReuseDecision(session, to) {
   const projectId = getSessionProjectId(session);
   const connectionId = session?.context?.connectionId || null;
+  const connectionIdentifier = session?.context?.connectionIdentifier || null;
   const projectOverrideActive = Boolean(getSessionProjectOverride(session));
-  const sessionTo = normalizeSessionIdentifier(session?.context?.to || '');
-  const currentTo = normalizeSessionIdentifier(to);
+  const sessionTo = normalizeChannelAddress(
+    session?.context?.to || session?.context?.connectionIdentifier || '',
+  );
+  const currentTo = normalizeChannelAddress(to);
 
   if (!projectId) {
     return {
@@ -147,6 +359,7 @@ function getSessionRoutingReuseDecision(session, to) {
       reason: 'session_missing_projectId',
       projectId: null,
       connectionId,
+      connectionIdentifier,
     };
   }
 
@@ -156,6 +369,7 @@ function getSessionRoutingReuseDecision(session, to) {
       reason: 'session_override_active',
       projectId,
       connectionId,
+      connectionIdentifier,
     };
   }
 
@@ -164,7 +378,8 @@ function getSessionRoutingReuseDecision(session, to) {
       canReuse: false,
       reason: 'session_missing_connectionId',
       projectId,
-      connectionId: null,
+      connectionId,
+      connectionIdentifier,
     };
   }
 
@@ -174,6 +389,7 @@ function getSessionRoutingReuseDecision(session, to) {
       reason: 'session_destination_mismatch',
       projectId,
       connectionId,
+      connectionIdentifier,
       sessionTo,
       currentTo,
     };
@@ -184,6 +400,9 @@ function getSessionRoutingReuseDecision(session, to) {
     reason: 'session_context_complete',
     projectId,
     connectionId,
+    connectionIdentifier,
+    sessionTo,
+    currentTo,
   };
 }
 
@@ -197,6 +416,13 @@ function getStepLogName(step) {
 
 function createInitialSession(context = {}, projectOverride = null) {
   const tenantSlug = ACTIVE_TENANT_SLUG;
+  const normalizedContext = mergeSessionContext(
+    {},
+    {
+      ...context,
+      projectId: pickContextValue(context.projectId, projectOverride?.projectId),
+    },
+  );
 
   return {
     step: SESSION_STEPS.MENU,
@@ -210,39 +436,48 @@ function createInitialSession(context = {}, projectOverride = null) {
     },
     projectOverride: projectOverride || null,
     context: {
-      from: context.from || '',
-      to: context.to || null,
-      projectId: context.projectId || null,
+      from: normalizedContext.from || '',
+      to: normalizedContext.to || null,
+      projectId: normalizedContext.projectId || null,
       tenantSlug,
-      connectionId: context.connectionId || null,
-      connectionIdentifier: context.connectionIdentifier || null,
-      botProfile: context.botProfile || null,
-      botProfileId: context.botProfileId || null,
-      botProfileFallbackUsed: context.botProfileFallbackUsed || false,
-      botProfileSource: context.botProfileSource || null,
-      routingSource: context.routingSource || null,
-      devMode: context.devMode || false,
-      projectOverrideUsed: context.projectOverrideUsed || false,
+      connectionId: normalizedContext.connectionId || null,
+      connectionIdentifier: normalizedContext.connectionIdentifier || null,
+      botProfile: normalizedContext.botProfile || null,
+      botProfileId: normalizedContext.botProfileId || null,
+      botProfileFallbackUsed: normalizedContext.botProfileFallbackUsed || false,
+      botProfileSource: normalizedContext.botProfileSource || null,
+      routingSource: normalizedContext.routingSource || null,
+      devMode: normalizedContext.devMode || false,
+      projectOverrideUsed: normalizedContext.projectOverrideUsed || false,
     },
   };
 }
 
 function hydratePersistedSession(sessionRecord, context = {}) {
   const persistedData = sessionRecord?.data || {};
-  const hydratedSession = createInitialSession(
-    {
-      ...(persistedData.context || {}),
-      ...context,
-      projectId:
-        context.projectId ||
-        persistedData.context?.projectId ||
-        persistedData.projectId ||
-        persistedData.projectOverride?.projectId ||
-        null,
-      tenantSlug: ACTIVE_TENANT_SLUG,
-    },
-    persistedData.projectOverride || null,
-  );
+  const persistedContext = persistedData.context || {};
+  const normalizedContext = mergeSessionContext(persistedContext, {
+    ...context,
+    projectId: pickContextValue(
+      context.projectId,
+      persistedContext.projectId,
+      persistedData.projectId,
+      persistedData.projectOverride?.projectId,
+    ),
+    to: pickContextValue(
+      context.to,
+      persistedContext.to,
+      persistedData.to,
+      persistedContext.connectionIdentifier,
+    ),
+    connectionIdentifier: pickContextValue(
+      context.connectionIdentifier,
+      persistedContext.connectionIdentifier,
+      persistedContext.to,
+      persistedData.to,
+    ),
+  });
+  const hydratedSession = createInitialSession(normalizedContext, persistedData.projectOverride || null);
 
   hydratedSession.step = persistedData.currentStep || hydratedSession.step;
   hydratedSession.data = {
@@ -251,9 +486,7 @@ function hydratePersistedSession(sessionRecord, context = {}) {
   };
   hydratedSession.tenantSlug = ACTIVE_TENANT_SLUG;
   hydratedSession.context = {
-    ...hydratedSession.context,
-    ...(persistedData.context || {}),
-    ...context,
+    ...mergeSessionContext(hydratedSession.context, normalizedContext),
     tenantSlug: ACTIVE_TENANT_SLUG,
   };
 
@@ -311,6 +544,12 @@ async function persistSessionState(sessionKey, options = {}) {
   }
 
   try {
+    logContextResolution('persistedTo', session.context?.to || null, {
+      sessionKey,
+      connectionIdentifier: session.context?.connectionIdentifier || null,
+      projectId: session.context?.projectId || null,
+      currentStep: session.step || null,
+    });
     const persistedSession = await upsertBotSession({
       sessionKey,
       session,
@@ -323,6 +562,8 @@ async function persistSessionState(sessionKey, options = {}) {
       sessionId: persistedSession.id,
       projectId: persistedSession.data.projectId || null,
       currentStep: persistedSession.data.currentStep || null,
+      to: persistedSession.data.context?.to || persistedSession.data.to || null,
+      connectionIdentifier: persistedSession.data.context?.connectionIdentifier || null,
       status: options.status || 'active',
     });
 
@@ -342,6 +583,12 @@ async function persistSessionState(sessionKey, options = {}) {
 async function loadSessionState(sessionKey, context = {}) {
   if (sessions[sessionKey]) {
     ensureSession(sessionKey, context);
+    logContextResolution('rehydratedTo', sessions[sessionKey].context?.to || null, {
+      sessionKey,
+      source: 'memory',
+      connectionIdentifier: sessions[sessionKey].context?.connectionIdentifier || null,
+      projectId: sessions[sessionKey].context?.projectId || null,
+    });
     logFlow('sessionLoaded', {
       sessionKey,
       source: 'memory',
@@ -356,6 +603,15 @@ async function loadSessionState(sessionKey, context = {}) {
 
     if (!persistedSession) {
       sessions[sessionKey] = createInitialSession(context);
+      logContextResolution('persistedTo', null, {
+        sessionKey,
+        source: 'initialized',
+      });
+      logContextResolution('rehydratedTo', sessions[sessionKey].context?.to || null, {
+        sessionKey,
+        source: 'initialized',
+        connectionIdentifier: sessions[sessionKey].context?.connectionIdentifier || null,
+      });
       logFlow('sessionLoaded', {
         sessionKey,
         source: 'initialized',
@@ -365,7 +621,19 @@ async function loadSessionState(sessionKey, context = {}) {
       return sessions[sessionKey];
     }
 
+    logContextResolution('persistedTo', extractStoredSessionTo(persistedSession.data), {
+      sessionKey,
+      source: 'firestore',
+      connectionIdentifier: extractStoredConnectionIdentifier(persistedSession.data),
+      projectId: persistedSession.data?.context?.projectId || persistedSession.data?.projectId || null,
+    });
     sessions[sessionKey] = hydratePersistedSession(persistedSession, context);
+    logContextResolution('rehydratedTo', sessions[sessionKey].context?.to || null, {
+      sessionKey,
+      source: 'firestore',
+      connectionIdentifier: sessions[sessionKey].context?.connectionIdentifier || null,
+      projectId: sessions[sessionKey].context?.projectId || null,
+    });
     logFlow('sessionLoaded', {
       sessionKey,
       source: 'firestore',
@@ -406,8 +674,7 @@ function ensureSession(sessionKey, context = {}) {
 
     sessions[sessionKey].tenantSlug = contextTenantSlug;
     sessions[sessionKey].context = {
-      ...sessions[sessionKey].context,
-      ...context,
+      ...mergeSessionContext(sessions[sessionKey].context, context),
       tenantSlug: contextTenantSlug,
     };
   }
@@ -538,7 +805,13 @@ async function resolveRoutingContextFromSession({
 
   const project = await getProjectById(projectId);
   const routingContext = {
-    to: session?.context?.to || String(to || '').trim().toLowerCase() || null,
+    to:
+      normalizeChannelAddress(
+        session?.context?.to ||
+          session?.context?.connectionIdentifier ||
+          String(to || '').trim().toLowerCase() ||
+          null,
+      ) || null,
     connection:
       session?.context?.connectionId || session?.context?.connectionIdentifier
         ? {
@@ -581,6 +854,17 @@ function logResolvedRoutingContext(sessionKey, from, to, routingContext) {
     connectionIdentifier: routingContext?.connection?.identifier || routingContext?.to || null,
     routingSource: routingContext?.routingSource || null,
   });
+  logContextResolution(
+    'connectionIdentifier',
+    routingContext?.connection?.identifier || routingContext?.to || null,
+    {
+      sessionKey,
+      from,
+      to: routingContext?.to || String(to || '').trim().toLowerCase() || null,
+      connectionId: routingContext?.connection?.id || null,
+      routingSource: routingContext?.routingSource || null,
+    },
+  );
   logContextResolution('projectResolved', routingContext?.project?.id || null, {
     sessionKey,
     from,
@@ -1145,14 +1429,32 @@ async function handler(req, res) {
   req.body = normalizarBody(req);
 
   const from = String(req.body.From || 'unknown').trim();
-  const to = String(req.body.To || '').trim();
+  const requestTo = String(req.body.To || '').trim();
   const mensagemRecebida = req.body.Body || '';
-  const sessionKey = buildSessionKey(from, to);
+  const addressing = await resolveIncomingAddressing({
+    from,
+    requestTo,
+  });
+  const to = addressing.currentTo;
+  const sessionKey = addressing.sessionKey;
 
+  console.log('[webhook] Payload relevante do Twilio:', buildTwilioPayloadLog(req.body));
   console.log('[webhook] Número do remetente:', from);
   console.log('[webhook] Número de destino:', to);
   console.log('[webhook] Mensagem recebida:', mensagemRecebida);
   console.log(`[bot] activeTenant=${ACTIVE_TENANT_SLUG}`);
+  logContextResolution('currentTo', to, {
+    sessionKey,
+    requestTo: normalizeChannelAddress(requestTo),
+    addressingSource: addressing.source,
+    candidateReason: addressing.candidateReason || null,
+    candidateCount: addressing.candidateCount || 0,
+  });
+  logContextResolution('persistedTo', addressing.persistedTo || null, {
+    sessionKey,
+    requestTo: normalizeChannelAddress(requestTo),
+    addressingSource: addressing.source,
+  });
 
   // O `/dev` existe apenas para teste/demo no WhatsApp Sandbox. Nesta fase,
   // ele aceita somente o tenant piloto clinica-devtec.
@@ -1176,7 +1478,7 @@ async function handler(req, res) {
 
     const session = ensureSession(sessionKey, {
       from,
-      to: String(to || '').trim().toLowerCase() || null,
+      to,
       tenantSlug: ACTIVE_TENANT_SLUG,
     });
 
@@ -1188,7 +1490,7 @@ async function handler(req, res) {
         sessionKey,
         {
           from,
-          to: String(to || '').trim().toLowerCase() || null,
+          to,
           projectId: devCommandResult.project.id,
           tenantSlug,
           devMode: true,
@@ -1223,7 +1525,7 @@ async function handler(req, res) {
         sessionKey,
         {
           from,
-          to: String(to || '').trim().toLowerCase() || null,
+          to,
           tenantSlug: ACTIVE_TENANT_SLUG,
           devMode: false,
           projectOverrideUsed: false,
@@ -1273,8 +1575,13 @@ async function handler(req, res) {
 
   const loadedSession = await loadSessionState(sessionKey, {
     from,
-    to: String(to || '').trim().toLowerCase() || null,
+    to,
     tenantSlug: ACTIVE_TENANT_SLUG,
+  });
+  logContextResolution('sessionTo', loadedSession?.context?.to || null, {
+    sessionKey,
+    connectionIdentifier: loadedSession?.context?.connectionIdentifier || null,
+    projectId: loadedSession?.context?.projectId || null,
   });
   console.log('[bot][session] loaded tenantSlug=... step=...', {
     sessionKey,
@@ -1297,6 +1604,7 @@ async function handler(req, res) {
       currentStep: loadedSession?.step || null,
       projectId: sessionRoutingReuseDecision.projectId || null,
       connectionId: sessionRoutingReuseDecision.connectionId || null,
+      connectionIdentifier: sessionRoutingReuseDecision.connectionIdentifier || null,
       routingSource: loadedSession?.context?.routingSource || null,
       sessionTo: sessionRoutingReuseDecision.sessionTo || null,
       currentTo: sessionRoutingReuseDecision.currentTo || null,
@@ -1340,6 +1648,7 @@ async function handler(req, res) {
         from,
         to,
         sessionKey,
+        connectionIdentifier: loadedSession?.context?.connectionIdentifier || null,
         activeTenantSlug: ACTIVE_TENANT_SLUG,
         hasProjectOverride: Boolean(getSessionProjectOverride(loadedSession)),
       });
