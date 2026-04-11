@@ -560,6 +560,99 @@ test('continua o fluxo ao receber o nome mesmo sem ProjectConnection no meio da 
   );
 });
 
+test('escolher serviço no webhook sempre devolve o prompt de nome e persiste a sessão', async () => {
+  const from = 'whatsapp:+5534999991111';
+  const to = 'whatsapp:+14155238886';
+  const { firestoreStore } = setFirebaseAdminMock({
+    initialBotCollections: {
+      projectConnections: {
+        'connection-1': {
+          connectionType: 'whatsapp',
+          provider: 'twilio',
+          identifier: to,
+          projectId: 'clinic-project',
+          tenantSlug: 'clinica-devtec',
+          active: true,
+        },
+      },
+      projects: {
+        'clinic-project': {
+          slug: 'clinica-devtec',
+          name: 'Clínica Devtec',
+          active: true,
+        },
+      },
+      botProfiles: {
+        'clinic-project': {
+          projectId: 'clinic-project',
+          assistantName: 'Clara',
+          businessName: 'Clínica Devtec',
+          closingMessage: 'Nossa equipe vai confirmar os próximos passos em breve.',
+          active: true,
+        },
+      },
+    },
+  });
+
+  await invokeWebhook({ from, to, body: 'oi' });
+  await invokeWebhook({ from, to, body: '1' });
+  const serviceResponse = await invokeWebhook({ from, to, body: '1' });
+
+  const sessionId = buildSessionDocumentId(buildSessionKey(from, to));
+  const sessionDoc = firestoreStore.get('sessions', sessionId);
+
+  assert.match(serviceResponse.body, /Agora me informe o seu nome completo/i);
+  assert.ok(serviceResponse.body.trim().length > 0);
+  assert.ok(sessionDoc);
+  assert.equal(sessionDoc.currentStep, SESSION_STEPS.AWAITING_NAME);
+  assert.equal(sessionDoc.selectedServiceKey, 'consulta');
+  assert.equal(sessionDoc.selectedServiceLabel, 'Consulta');
+});
+
+test('dev reset continua respondendo mesmo após a seleção do serviço', async () => {
+  const from = 'whatsapp:+5534999991111';
+  const to = 'whatsapp:+14155238886';
+
+  setFirebaseAdminMock({
+    initialBotCollections: {
+      projectConnections: {
+        'connection-1': {
+          connectionType: 'whatsapp',
+          provider: 'twilio',
+          identifier: to,
+          projectId: 'clinic-project',
+          tenantSlug: 'clinica-devtec',
+          active: true,
+        },
+      },
+      projects: {
+        'clinic-project': {
+          slug: 'clinica-devtec',
+          name: 'Clínica Devtec',
+          active: true,
+        },
+      },
+      botProfiles: {
+        'clinic-project': {
+          projectId: 'clinic-project',
+          assistantName: 'Clara',
+          businessName: 'Clínica Devtec',
+          closingMessage: 'Nossa equipe vai confirmar os próximos passos em breve.',
+          active: true,
+        },
+      },
+    },
+  });
+
+  await invokeWebhook({ from, to, body: 'oi' });
+  await invokeWebhook({ from, to, body: '1' });
+  await invokeWebhook({ from, to, body: '1' });
+  const resetResponse = await invokeWebhook({ from, to, body: '/dev reset' });
+
+  assert.ok(resetResponse.body.trim().length > 0);
+  assert.match(resetResponse.body, /<Message>/i);
+});
+
 test('inclui o serviço no payload persistido da serviceRequest', () => {
   const serviceRequestData = buildServiceRequestData(
     {

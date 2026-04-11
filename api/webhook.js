@@ -114,6 +114,10 @@ function logEarlyReturn(reason, metadata = {}) {
   console.log(`[bot][flow] earlyReturnReason=${reason}`, metadata);
 }
 
+function hasResponseMessage(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
 function getSessionProjectId(session) {
   return (
     session?.context?.projectId ||
@@ -724,6 +728,14 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
   }
 
   if (session.step === SESSION_STEPS.AWAITING_SERVICE) {
+    console.log('[bot][service-step] current=AWAITING_SERVICE', {
+      sessionKey,
+      projectId: getSessionProjectId(session),
+      selectedServiceKey: session.data.selectedServiceKey || '',
+      selectedServiceLabel: session.data.selectedServiceLabel || '',
+    });
+    console.log(`[bot][service-step] selected=${cleanedMessage}`);
+
     const serviceSelection = resolveServiceSelection(cleanedMessage, serviceCatalog.services, {
       numberOnly: true,
     });
@@ -758,8 +770,30 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
     });
 
     setSessionStep(sessionKey, SESSION_STEPS.AWAITING_NAME);
-    await persistSessionState(sessionKey, { lastInboundText: cleanedMessage });
-    return getNamePromptMessage(routingContext.botProfile, session.data.selectedServiceLabel);
+    console.log('[bot][service-step] next=AWAITING_NAME', {
+      sessionKey,
+      serviceKey: session.data.selectedServiceKey,
+      serviceLabel: session.data.selectedServiceLabel,
+    });
+
+    const persistedSession = await persistSessionState(sessionKey, { lastInboundText: cleanedMessage });
+    console.log('[bot][service-step] sessionPersisted', {
+      sessionKey,
+      persisted: Boolean(persistedSession),
+      currentStep: sessions[sessionKey]?.step || null,
+      selectedServiceKey: sessions[sessionKey]?.data?.selectedServiceKey || '',
+      selectedServiceLabel: sessions[sessionKey]?.data?.selectedServiceLabel || '',
+    });
+
+    const namePromptMessage = getNamePromptMessage(
+      routingContext.botProfile,
+      session.data.selectedServiceLabel,
+    );
+    console.log('[bot][service-step] responseBuilt=true', {
+      sessionKey,
+      responseLength: namePromptMessage.length,
+    });
+    return namePromptMessage;
   }
 
   if (session.step === SESSION_STEPS.AWAITING_NAME) {
@@ -1293,14 +1327,45 @@ async function handler(req, res) {
   // TwiML e o XML que a Twilio entende como instrucao de resposta.
   // Aqui usamos a biblioteca oficial para montar a resposta do WhatsApp.
   const twiml = new twilio.twiml.MessagingResponse();
-  twiml.message(
-    await montarRespostaBot({
+  let responseMessage;
+
+  try {
+    responseMessage = await montarRespostaBot({
       sessionKey,
       from,
       routingContext,
       mensagemTexto: mensagemRecebida,
-    }),
-  );
+    });
+  } catch (error) {
+    console.error('[bot][response] buildFailed', {
+      sessionKey,
+      message: error.message,
+      code: error.code || null,
+      currentStep: sessions[sessionKey]?.step || null,
+    });
+    responseMessage = getConversationFallbackMessage(routingContext.botProfile);
+  }
+
+  if (!hasResponseMessage(responseMessage)) {
+    logEarlyReturn('empty_response_message', {
+      sessionKey,
+      currentStep: sessions[sessionKey]?.step || null,
+      projectId: routingContext.project?.id || null,
+    });
+    console.log('[bot][response] built=false', {
+      sessionKey,
+      currentStep: sessions[sessionKey]?.step || null,
+    });
+    responseMessage = getConversationFallbackMessage(routingContext.botProfile);
+  } else {
+    console.log('[bot][response] built=true', {
+      sessionKey,
+      currentStep: sessions[sessionKey]?.step || null,
+      responseLength: responseMessage.length,
+    });
+  }
+
+  twiml.message(responseMessage);
 
   res.setHeader('Content-Type', 'text/xml');
   return res.status(200).send(twiml.toString());
