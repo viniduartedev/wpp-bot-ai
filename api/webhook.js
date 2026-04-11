@@ -57,6 +57,7 @@ const {
   getBotProfileByProject,
   isBotProfileInactive,
 } = require('../lib/core/botProfiles');
+const { getProjectById } = require('../lib/core/projects');
 const { logInboundEvent } = require('../lib/core/inboundEvents');
 const { resolveProjectForConversation } = require('../lib/routing/resolveProject');
 const { ACTIVE_TENANT_SLUG } = require('../lib/tenant');
@@ -111,6 +112,22 @@ function logFlow(stage, metadata = {}) {
 
 function logEarlyReturn(reason, metadata = {}) {
   console.log(`[bot][flow] earlyReturnReason=${reason}`, metadata);
+}
+
+function getSessionProjectId(session) {
+  return (
+    session?.context?.projectId ||
+    session?.projectOverride?.projectId ||
+    null
+  );
+}
+
+function getStepLogName(step) {
+  if (step === SESSION_STEPS.AWAITING_NAME) {
+    return 'AWAITING_CUSTOMER_NAME';
+  }
+
+  return String(step || '').trim().toUpperCase() || 'UNKNOWN';
 }
 
 function createInitialSession(context = {}, projectOverride = null) {
@@ -442,6 +459,49 @@ async function persistInboundReceivedEvent({
   }
 }
 
+async function resolveRoutingContextFromSession({
+  from,
+  to,
+  sessionKey,
+  session,
+}) {
+  const projectId = getSessionProjectId(session);
+
+  if (!projectId) {
+    return null;
+  }
+
+  const project = await getProjectById(projectId);
+  const routingContext = {
+    to: session?.context?.to || String(to || '').trim().toLowerCase() || null,
+    connection:
+      session?.context?.connectionId || session?.context?.connectionIdentifier
+        ? {
+            id: session.context.connectionId || null,
+            identifier: session.context.connectionIdentifier || session.context.to || null,
+          }
+        : null,
+    project,
+    projectOverride: session?.projectOverride || null,
+    tenantSlug: ACTIVE_TENANT_SLUG,
+    devMode: session?.context?.devMode || false,
+    projectOverrideUsed: session?.context?.projectOverrideUsed || false,
+    routingSource: 'persisted_session',
+    reusedSessionRouting: true,
+  };
+
+  console.log('[bot][routing] calledDuringStep=false', {
+    sessionKey,
+    from,
+    to: routingContext.to,
+    currentStep: session?.step || null,
+    projectId,
+    routingSource: routingContext.routingSource,
+  });
+
+  return routingContext;
+}
+
 async function resolveProjectServices(routingContext, options = {}) {
   const tenantSlug = ACTIVE_TENANT_SLUG;
   const serviceCatalog = await loadRuntimeProjectServices(routingContext?.project || null, {
@@ -703,6 +763,20 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
   }
 
   if (session.step === SESSION_STEPS.AWAITING_NAME) {
+    console.log('[bot][step] current=AWAITING_CUSTOMER_NAME', {
+      sessionKey,
+      projectId: getSessionProjectId(session),
+    });
+    console.log(`[bot][input] customerName=${cleanedMessage}`);
+    console.log('[bot][session] loaded tenantSlug=... step=...', {
+      sessionKey,
+      tenantSlug: session.tenantSlug || null,
+      step: session.step || null,
+      projectId: getSessionProjectId(session),
+      selectedServiceKey: session.data.selectedServiceKey || '',
+      selectedServiceLabel: session.data.selectedServiceLabel || '',
+    });
+
     const nameResult = normalizeNameInput(cleanedMessage);
 
     if (!nameResult.isValid) {
@@ -716,6 +790,12 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
     session.data.name = nameResult.value;
     setSessionStep(sessionKey, SESSION_STEPS.AWAITING_DATE);
     await persistSessionState(sessionKey, { lastInboundText: cleanedMessage });
+    console.log('[bot][session] saved nextStep=...', {
+      sessionKey,
+      nextStep: SESSION_STEPS.AWAITING_DATE,
+      customerName: session.data.name,
+      projectId: getSessionProjectId(session),
+    });
     return getDatePromptMessage(routingContext.botProfile, session.data.name);
   }
 
@@ -1052,46 +1132,94 @@ async function handler(req, res) {
     return res.status(200).send(devTwiml.toString());
   }
 
+  const loadedSession = await loadSessionState(sessionKey, {
+    from,
+    to: String(to || '').trim().toLowerCase() || null,
+    tenantSlug: ACTIVE_TENANT_SLUG,
+  });
+  console.log('[bot][session] loaded tenantSlug=... step=...', {
+    sessionKey,
+    tenantSlug: loadedSession?.tenantSlug || null,
+    step: loadedSession?.step || null,
+    projectId: getSessionProjectId(loadedSession),
+    selectedServiceKey: loadedSession?.data?.selectedServiceKey || '',
+    selectedServiceLabel: loadedSession?.data?.selectedServiceLabel || '',
+  });
+
   let routingContext;
+  const shouldReuseSessionRouting = Boolean(getSessionProjectId(loadedSession));
 
-  try {
-    console.log('[routing] Iniciando resolução do projeto da conversa:', {
-      from,
-      to,
-      sessionKey,
-      activeTenantSlug: ACTIVE_TENANT_SLUG,
-      hasProjectOverride: Boolean(getSessionProjectOverride(sessions[sessionKey])),
-    });
-
-    routingContext = await resolveProjectForConversation({
-      to,
-      session: sessions[sessionKey],
-    });
-  } catch (error) {
-    console.error('[routing] Falha ao resolver canal do WhatsApp:', {
-      from,
-      to,
-      code: error.code || null,
-      message: error.message,
-      connectionId: error.connectionId || null,
-      projectId: error.projectId || null,
-      activeTenantSlug: ACTIVE_TENANT_SLUG,
-    });
-
-    await logProjectRoutingFailure({
-      phone: from,
-      to,
-      error,
-      metadata: {
+  if (shouldReuseSessionRouting) {
+    try {
+      routingContext = await resolveRoutingContextFromSession({
+        from,
+        to,
+        sessionKey,
+        session: loadedSession,
+      });
+    } catch (error) {
+      console.error('[routing] Falha ao reutilizar contexto persistido da sessao:', {
+        from,
+        to,
+        code: error.code || null,
+        message: error.message,
+        projectId: getSessionProjectId(loadedSession),
         activeTenantSlug: ACTIVE_TENANT_SLUG,
-      },
+      });
+
+      const unavailableTwiml = new twilio.twiml.MessagingResponse();
+      unavailableTwiml.message(getChannelUnavailableMessage());
+
+      res.setHeader('Content-Type', 'text/xml');
+      return res.status(200).send(unavailableTwiml.toString());
+    }
+  } else {
+    console.log('[bot][routing] calledDuringStep=true', {
+      sessionKey,
+      currentStep: loadedSession?.step || null,
+      projectId: getSessionProjectId(loadedSession),
+      to,
     });
 
-    const unavailableTwiml = new twilio.twiml.MessagingResponse();
-    unavailableTwiml.message(getChannelUnavailableMessage());
+    try {
+      console.log('[routing] Iniciando resolução do projeto da conversa:', {
+        from,
+        to,
+        sessionKey,
+        activeTenantSlug: ACTIVE_TENANT_SLUG,
+        hasProjectOverride: Boolean(getSessionProjectOverride(loadedSession)),
+      });
 
-    res.setHeader('Content-Type', 'text/xml');
-    return res.status(200).send(unavailableTwiml.toString());
+      routingContext = await resolveProjectForConversation({
+        to,
+        session: loadedSession,
+      });
+    } catch (error) {
+      console.error('[routing] Falha ao resolver canal do WhatsApp:', {
+        from,
+        to,
+        code: error.code || null,
+        message: error.message,
+        connectionId: error.connectionId || null,
+        projectId: error.projectId || null,
+        activeTenantSlug: ACTIVE_TENANT_SLUG,
+      });
+
+      await logProjectRoutingFailure({
+        phone: from,
+        to,
+        error,
+        metadata: {
+          activeTenantSlug: ACTIVE_TENANT_SLUG,
+        },
+      });
+
+      const unavailableTwiml = new twilio.twiml.MessagingResponse();
+      unavailableTwiml.message(getChannelUnavailableMessage());
+
+      res.setHeader('Content-Type', 'text/xml');
+      return res.status(200).send(unavailableTwiml.toString());
+    }
   }
 
   try {
@@ -1142,16 +1270,13 @@ async function handler(req, res) {
     botProfileFallbackUsed: routingContext.botProfile?.fallbackUsed || false,
   });
 
-  const loadedSession = await loadSessionState(
-    sessionKey,
-    buildSessionContext(from, routingContext),
-  );
+  ensureSession(sessionKey, buildSessionContext(from, routingContext));
   logFlow('inboundReceived', {
     sessionKey,
     from,
     to: routingContext.to,
     projectId: routingContext.project.id,
-    currentStep: loadedSession?.step || null,
+    currentStep: sessions[sessionKey]?.step || null,
     messageText: mensagemRecebida,
   });
   await persistInboundReceivedEvent({
@@ -1159,7 +1284,7 @@ async function handler(req, res) {
     messageText: mensagemRecebida,
     sessionKey,
     routingContext,
-    session: loadedSession,
+    session: sessions[sessionKey],
   });
   await persistSessionState(sessionKey, { lastInboundText: mensagemRecebida });
 

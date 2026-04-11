@@ -492,6 +492,74 @@ test('inclui o serviço selecionado no resumo final do fluxo', async () => {
   assert.equal(sessions[sessionKey].step, SESSION_STEPS.AWAITING_CONFIRMATION);
 });
 
+test('continua o fluxo ao receber o nome mesmo sem ProjectConnection no meio da conversa', async () => {
+  const from = 'whatsapp:+5534999991111';
+  const to = 'whatsapp:+14155238886';
+  const { firestoreStore } = setFirebaseAdminMock({
+    initialBotCollections: {
+      projectConnections: {
+        'connection-1': {
+          connectionType: 'whatsapp',
+          provider: 'twilio',
+          identifier: to,
+          projectId: 'clinic-project',
+          tenantSlug: 'clinica-devtec',
+          active: true,
+        },
+      },
+      projects: {
+        'clinic-project': {
+          slug: 'clinica-devtec',
+          name: 'Clínica Devtec',
+          active: true,
+        },
+      },
+      botProfiles: {
+        'clinic-project': {
+          projectId: 'clinic-project',
+          assistantName: 'Clara',
+          businessName: 'Clínica Devtec',
+          closingMessage: 'Nossa equipe vai confirmar os próximos passos em breve.',
+          active: true,
+        },
+      },
+    },
+  });
+
+  await invokeWebhook({ from, to, body: 'oi' });
+  await invokeWebhook({ from, to, body: '1' });
+  const serviceResponse = await invokeWebhook({ from, to, body: '1' });
+
+  assert.match(serviceResponse.body, /nome completo/i);
+
+  await firestoreStore.collection('projectConnections').doc('connection-1').set({
+    connectionType: 'whatsapp',
+    provider: 'twilio',
+    identifier: 'whatsapp:+00000000000',
+    projectId: 'clinic-project',
+    tenantSlug: 'clinica-devtec',
+    active: false,
+  });
+
+  clearSessions();
+
+  const nameResponse = await invokeWebhook({ from, to, body: 'Maria da Silva' });
+  const sessionId = buildSessionDocumentId(buildSessionKey(from, to));
+  const sessionDoc = firestoreStore.get('sessions', sessionId);
+  const inboundEvents = firestoreStore.list('inboundEvents');
+
+  assert.match(nameResponse.body, /qual data/i);
+  assert.ok(sessionDoc);
+  assert.equal(sessionDoc.currentStep, SESSION_STEPS.AWAITING_DATE);
+  assert.equal(sessionDoc.data.name, 'Maria da Silva');
+  assert.equal(sessionDoc.projectId, 'clinic-project');
+  assert.equal(sessionDoc.selectedServiceKey, 'consulta');
+  assert.equal(
+    inboundEvents.some((event) => event.eventType === 'channel_routing_failed'),
+    false,
+  );
+});
+
 test('inclui o serviço no payload persistido da serviceRequest', () => {
   const serviceRequestData = buildServiceRequestData(
     {
