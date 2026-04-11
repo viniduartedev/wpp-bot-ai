@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const webhookHandler = require('../api/webhook');
 const { buildServiceRequestData } = require('../lib/core/serviceRequests');
 const { loadProjectServices, loadRuntimeProjectServices } = require('../lib/bot/services');
-const { buildSessionData } = require('../lib/core/sessions');
+const { buildSessionData, buildSessionDocumentId } = require('../lib/core/sessions');
 const { parseDevCommand, resolveProjectByDevInput } = require('../lib/dev/commands');
 const { setSessionProjectOverride } = require('../lib/dev/projectOverride');
 
@@ -50,6 +50,171 @@ const DEFAULT_AGENDA_SERVICES = [
   },
 ];
 
+function deepClone(value) {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+function createFirestoreStore(initialCollections = {}) {
+  const collections = new Map();
+  const counters = new Map();
+
+  Object.entries(initialCollections).forEach(([collectionName, docs]) => {
+    collections.set(
+      collectionName,
+      new Map(
+        Object.entries(docs || {}).map(([docId, data]) => [docId, deepClone(data)]),
+      ),
+    );
+  });
+
+  function ensureCollection(collectionName) {
+    if (!collections.has(collectionName)) {
+      collections.set(collectionName, new Map());
+    }
+
+    return collections.get(collectionName);
+  }
+
+  function nextId(collectionName) {
+    const nextValue = (counters.get(collectionName) || 0) + 1;
+    counters.set(collectionName, nextValue);
+    return `${collectionName}-${nextValue}`;
+  }
+
+  function mergeData(currentValue, nextValue) {
+    return {
+      ...(deepClone(currentValue) || {}),
+      ...(deepClone(nextValue) || {}),
+    };
+  }
+
+  function writeDoc(collectionName, docId, data, options = {}) {
+    const collection = ensureCollection(collectionName);
+
+    if (options.merge && collection.has(docId)) {
+      collection.set(docId, mergeData(collection.get(docId), data));
+      return;
+    }
+
+    collection.set(docId, deepClone(data));
+  }
+
+  function buildDocRef(collectionName, docId) {
+    return {
+      id: docId,
+      _collectionName: collectionName,
+      async set(data, options = {}) {
+        writeDoc(collectionName, docId, data, options);
+      },
+      async get() {
+        return buildDocSnapshot(collectionName, docId);
+      },
+    };
+  }
+
+  function buildDocSnapshot(collectionName, docId) {
+    const collection = ensureCollection(collectionName);
+    const data = collection.get(docId);
+
+    return {
+      id: docId,
+      exists: typeof data !== 'undefined',
+      data: () => deepClone(data),
+      get: (fieldName) => data?.[fieldName],
+      ref: buildDocRef(collectionName, docId),
+    };
+  }
+
+  function matchesFilter(docData, filter) {
+    if (filter.operator !== '==') {
+      throw new Error(`Unsupported operator in test mock: ${filter.operator}`);
+    }
+
+    return docData?.[filter.field] === filter.value;
+  }
+
+  function buildQuery(collectionName, filters = [], limitValue = null) {
+    return {
+      where(field, operator, value) {
+        return buildQuery(
+          collectionName,
+          [...filters, { field, operator, value }],
+          limitValue,
+        );
+      },
+      limit(nextLimit) {
+        return buildQuery(collectionName, filters, nextLimit);
+      },
+      async get() {
+        let docs = Array.from(ensureCollection(collectionName).entries())
+          .filter(([, docData]) => filters.every((filter) => matchesFilter(docData, filter)))
+          .map(([docId]) => buildDocSnapshot(collectionName, docId));
+
+        if (typeof limitValue === 'number') {
+          docs = docs.slice(0, limitValue);
+        }
+
+        return {
+          empty: docs.length === 0,
+          size: docs.length,
+          docs,
+        };
+      },
+    };
+  }
+
+  return {
+    collection(collectionName) {
+      return {
+        doc(docId) {
+          return buildDocRef(collectionName, docId || nextId(collectionName));
+        },
+        async add(data) {
+          const docRef = buildDocRef(collectionName, nextId(collectionName));
+          await docRef.set(data);
+          return docRef;
+        },
+        where(field, operator, value) {
+          return buildQuery(collectionName, [{ field, operator, value }]);
+        },
+      };
+    },
+    batch() {
+      const operations = [];
+
+      return {
+        set(docRef, data, options = {}) {
+          operations.push({ docRef, data, options });
+        },
+        async commit() {
+          operations.forEach(({ docRef, data, options }) => {
+            writeDoc(docRef._collectionName, docRef.id, data, options);
+          });
+        },
+      };
+    },
+    list(collectionName) {
+      return Array.from(ensureCollection(collectionName).entries()).map(([id, data]) => ({
+        id,
+        ...deepClone(data),
+      }));
+    },
+    get(collectionName, docId) {
+      const collection = ensureCollection(collectionName);
+      const data = collection.get(docId);
+
+      if (typeof data === 'undefined') {
+        return null;
+      }
+
+      return {
+        id: docId,
+        ...deepClone(data),
+      };
+    },
+  };
+}
+
 function restoreFirebaseAdminModule() {
   if (originalFirebaseAdminModule) {
     require.cache[firebaseAdminModulePath] = originalFirebaseAdminModule;
@@ -62,6 +227,8 @@ function setFirebaseAdminMock(options = {}) {
   const agendaServices = options.agendaServices ?? DEFAULT_AGENDA_SERVICES;
   const queriedFilters = options.queriedFilters || [];
   const agendaProjectId = options.agendaProjectId || 'agendamento-ai-9fbfb';
+  const firestoreStore =
+    options.firestoreStore || createFirestoreStore(options.initialBotCollections);
   const fakeAdmin = {
     firestore: {
       FieldValue: {
@@ -70,15 +237,8 @@ function setFirebaseAdminMock(options = {}) {
     },
   };
   const fakeBotDb = {
-    batch: () => ({
-      set: () => {},
-      commit: async () => {},
-    }),
-    collection: () => ({
-      doc: () => ({
-        set: async () => {},
-      }),
-    }),
+    batch: () => firestoreStore.batch(),
+    collection: (collectionName) => firestoreStore.collection(collectionName),
   };
 
   require.cache[firebaseAdminModulePath] = {
@@ -124,6 +284,7 @@ function setFirebaseAdminMock(options = {}) {
   };
 
   return {
+    firestoreStore,
     queriedFilters,
   };
 }
@@ -158,6 +319,48 @@ function buildRoutingContext(overrides = {}) {
     projectOverrideUsed: false,
     ...overrides,
   };
+}
+
+function createResponseMock() {
+  return {
+    statusCode: 200,
+    headers: {},
+    body: '',
+    setHeader(name, value) {
+      this.headers[name] = value;
+    },
+    status(code) {
+      this.statusCode = code;
+      return this;
+    },
+    send(payload) {
+      this.body = payload;
+      return this;
+    },
+  };
+}
+
+async function invokeWebhook({
+  from = 'whatsapp:+5534999991111',
+  to = 'whatsapp:+5511999999999',
+  body,
+}) {
+  const req = {
+    method: 'POST',
+    body: {
+      From: from,
+      To: to,
+      Body: body,
+    },
+  };
+  const res = createResponseMock();
+
+  await webhookHandler(req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers['Content-Type'], 'text/xml');
+
+  return res;
 }
 
 test.beforeEach(() => {
@@ -506,4 +709,138 @@ test('monta payload de sessão com tenant e serviço selecionado para o botDb', 
   assert.equal(sessionData.selectedServiceKey, 'consulta_avaliacao');
   assert.equal(sessionData.selectedServiceLabel, 'Consulta de avaliação');
   assert.equal(sessionData.lastInboundText, '1');
+});
+
+test('rehidrata a sessão do Firestore e persiste inboundEvents, session e serviceRequest no fluxo real', async () => {
+  const from = 'whatsapp:+5534999991111';
+  const to = 'whatsapp:+5511999999999';
+  const { firestoreStore } = setFirebaseAdminMock({
+    initialBotCollections: {
+      projectConnections: {
+        'connection-1': {
+          connectionType: 'whatsapp',
+          provider: 'twilio',
+          identifier: to,
+          projectId: 'clinic-project',
+          tenantSlug: 'clinica-devtec',
+          active: true,
+        },
+      },
+      projects: {
+        'clinic-project': {
+          slug: 'clinica-devtec',
+          name: 'Clínica Devtec',
+          active: true,
+        },
+      },
+      botProfiles: {
+        'clinic-project': {
+          projectId: 'clinic-project',
+          assistantName: 'Clara',
+          businessName: 'Clínica Devtec',
+          closingMessage: 'Nossa equipe vai confirmar os próximos passos em breve.',
+          active: true,
+        },
+      },
+    },
+  });
+
+  for (const message of ['oi', '1', '1', 'Maria da Silva', '15/04', '14:00', '1']) {
+    await invokeWebhook({ from, to, body: message });
+    clearSessions();
+  }
+
+  const sessionId = buildSessionDocumentId(buildSessionKey(from, to));
+  const sessionDoc = firestoreStore.get('sessions', sessionId);
+  const inboundEvents = firestoreStore.list('inboundEvents');
+  const contacts = firestoreStore.list('contacts');
+  const serviceRequests = firestoreStore.list('serviceRequests');
+
+  assert.ok(sessionDoc);
+  assert.equal(sessionDoc.currentStep, SESSION_STEPS.MENU);
+  assert.equal(sessionDoc.status, 'completed');
+  assert.ok(
+    inboundEvents.some((event) => event.eventType === 'message_received' && event.status === 'received'),
+  );
+  assert.ok(
+    inboundEvents.some(
+      (event) =>
+        event.eventType === 'service_request_created' && event.status === 'processed',
+    ),
+  );
+  assert.equal(contacts.length, 1);
+  assert.equal(contacts[0].phone, from);
+  assert.equal(contacts[0].projectId, 'clinic-project');
+  assert.equal(contacts[0].name, 'Maria da Silva');
+  assert.equal(serviceRequests.length, 1);
+  assert.equal(serviceRequests[0].contactId, contacts[0].id);
+  assert.deepEqual(serviceRequests[0].service, {
+    key: 'consulta',
+    label: 'Consulta',
+  });
+});
+
+test('permite que o mesmo número abra mais de uma serviceRequest em momentos diferentes', async () => {
+  const from = 'whatsapp:+5534999991111';
+  const to = 'whatsapp:+5511999999999';
+  const { firestoreStore } = setFirebaseAdminMock({
+    initialBotCollections: {
+      projectConnections: {
+        'connection-1': {
+          connectionType: 'whatsapp',
+          provider: 'twilio',
+          identifier: to,
+          projectId: 'clinic-project',
+          tenantSlug: 'clinica-devtec',
+          active: true,
+        },
+      },
+      projects: {
+        'clinic-project': {
+          slug: 'clinica-devtec',
+          name: 'Clínica Devtec',
+          active: true,
+        },
+      },
+      botProfiles: {
+        'clinic-project': {
+          projectId: 'clinic-project',
+          assistantName: 'Clara',
+          businessName: 'Clínica Devtec',
+          closingMessage: 'Nossa equipe vai confirmar os próximos passos em breve.',
+          active: true,
+        },
+      },
+    },
+  });
+
+  const messageFlows = [
+    ['oi', '1', '1', 'Maria da Silva', '15/04', '14:00', '1'],
+    ['oi', '1', '2', 'João Pereira', '16/04', '15:00', '1'],
+  ];
+
+  for (const messages of messageFlows) {
+    for (const message of messages) {
+      await invokeWebhook({ from, to, body: message });
+      clearSessions();
+    }
+  }
+
+  const contacts = firestoreStore.list('contacts');
+  const serviceRequests = firestoreStore.list('serviceRequests');
+
+  assert.equal(contacts.length, 1);
+  assert.equal(serviceRequests.length, 2);
+  assert.deepEqual(
+    serviceRequests.map((serviceRequest) => serviceRequest.contactId),
+    [contacts[0].id, contacts[0].id],
+  );
+  assert.deepEqual(
+    serviceRequests.map((serviceRequest) => serviceRequest.requestedDate),
+    ['15/04', '16/04'],
+  );
+  assert.deepEqual(
+    serviceRequests.map((serviceRequest) => serviceRequest.service?.key),
+    ['consulta', 'retorno'],
+  );
 });

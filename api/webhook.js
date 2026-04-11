@@ -50,12 +50,14 @@ const {
 } = require('../lib/core/intake');
 const {
   buildSessionDocumentId,
+  getBotSession,
   upsertBotSession,
 } = require('../lib/core/sessions');
 const {
   getBotProfileByProject,
   isBotProfileInactive,
 } = require('../lib/core/botProfiles');
+const { logInboundEvent } = require('../lib/core/inboundEvents');
 const { resolveProjectForConversation } = require('../lib/routing/resolveProject');
 const { ACTIVE_TENANT_SLUG } = require('../lib/tenant');
 
@@ -103,6 +105,14 @@ function buildSessionContext(from, routingContext) {
   };
 }
 
+function logFlow(stage, metadata = {}) {
+  console.log(`[bot][flow] ${stage}`, metadata);
+}
+
+function logEarlyReturn(reason, metadata = {}) {
+  console.log(`[bot][flow] earlyReturnReason=${reason}`, metadata);
+}
+
 function createInitialSession(context = {}, projectOverride = null) {
   const tenantSlug = ACTIVE_TENANT_SLUG;
 
@@ -133,6 +143,39 @@ function createInitialSession(context = {}, projectOverride = null) {
       projectOverrideUsed: context.projectOverrideUsed || false,
     },
   };
+}
+
+function hydratePersistedSession(sessionRecord, context = {}) {
+  const persistedData = sessionRecord?.data || {};
+  const hydratedSession = createInitialSession(
+    {
+      ...(persistedData.context || {}),
+      ...context,
+      projectId:
+        context.projectId ||
+        persistedData.context?.projectId ||
+        persistedData.projectId ||
+        persistedData.projectOverride?.projectId ||
+        null,
+      tenantSlug: ACTIVE_TENANT_SLUG,
+    },
+    persistedData.projectOverride || null,
+  );
+
+  hydratedSession.step = persistedData.currentStep || hydratedSession.step;
+  hydratedSession.data = {
+    ...hydratedSession.data,
+    ...(persistedData.data || {}),
+  };
+  hydratedSession.tenantSlug = ACTIVE_TENANT_SLUG;
+  hydratedSession.context = {
+    ...hydratedSession.context,
+    ...(persistedData.context || {}),
+    ...context,
+    tenantSlug: ACTIVE_TENANT_SLUG,
+  };
+
+  return hydratedSession;
 }
 
 function normalizeMessage(message) {
@@ -186,12 +229,22 @@ async function persistSessionState(sessionKey, options = {}) {
   }
 
   try {
-    return await upsertBotSession({
+    const persistedSession = await upsertBotSession({
       sessionKey,
       session,
       status: options.status || 'active',
       lastInboundText: options.lastInboundText ?? null,
     });
+
+    logFlow('sessionSaved', {
+      sessionKey,
+      sessionId: persistedSession.id,
+      projectId: persistedSession.data.projectId || null,
+      currentStep: persistedSession.data.currentStep || null,
+      status: options.status || 'active',
+    });
+
+    return persistedSession;
   } catch (error) {
     console.error('[bot-runtime] sessionPersistFailed', {
       sessionKey,
@@ -201,6 +254,59 @@ async function persistSessionState(sessionKey, options = {}) {
       code: error.code || null,
     });
     return null;
+  }
+}
+
+async function loadSessionState(sessionKey, context = {}) {
+  if (sessions[sessionKey]) {
+    ensureSession(sessionKey, context);
+    logFlow('sessionLoaded', {
+      sessionKey,
+      source: 'memory',
+      currentStep: sessions[sessionKey].step || null,
+      projectId: sessions[sessionKey].context?.projectId || null,
+    });
+    return sessions[sessionKey];
+  }
+
+  try {
+    const persistedSession = await getBotSession(sessionKey);
+
+    if (!persistedSession) {
+      sessions[sessionKey] = createInitialSession(context);
+      logFlow('sessionLoaded', {
+        sessionKey,
+        source: 'initialized',
+        currentStep: sessions[sessionKey].step || null,
+        projectId: sessions[sessionKey].context?.projectId || null,
+      });
+      return sessions[sessionKey];
+    }
+
+    sessions[sessionKey] = hydratePersistedSession(persistedSession, context);
+    logFlow('sessionLoaded', {
+      sessionKey,
+      source: 'firestore',
+      sessionId: persistedSession.id,
+      currentStep: sessions[sessionKey].step || null,
+      projectId: sessions[sessionKey].context?.projectId || null,
+    });
+    return sessions[sessionKey];
+  } catch (error) {
+    console.error('[bot-runtime] sessionLoadFailed', {
+      sessionKey,
+      message: error.message,
+      code: error.code || null,
+    });
+
+    sessions[sessionKey] = createInitialSession(context);
+    logFlow('sessionLoaded', {
+      sessionKey,
+      source: 'initialized_after_error',
+      currentStep: sessions[sessionKey].step || null,
+      projectId: sessions[sessionKey].context?.projectId || null,
+    });
+    return sessions[sessionKey];
   }
 }
 
@@ -270,32 +376,70 @@ function closeSession(sessionKey, context = {}) {
   const previousStep = previousSession ? previousSession.step : null;
   const projectOverride = getSessionProjectOverride(previousSession);
 
-  if (projectOverride) {
-    sessions[sessionKey] = createInitialSession(
-      {
-        ...(previousSession?.context || {}),
-        ...context,
-      },
-      projectOverride,
-    );
-
-    console.log('[session] Sessão finalizada com override preservado:', {
-      sessionKey,
-      de: previousStep,
-      para: sessions[sessionKey].step,
-      projectOverride,
-    });
-
-    return sessions[sessionKey];
-  }
-
-  delete sessions[sessionKey];
+  sessions[sessionKey] = createInitialSession(
+    {
+      ...(previousSession?.context || {}),
+      ...context,
+    },
+    projectOverride,
+  );
 
   console.log('[session] Sessão finalizada:', {
     sessionKey,
     de: previousStep,
-    para: null,
+    para: sessions[sessionKey].step,
+    projectOverride,
   });
+
+  return sessions[sessionKey];
+}
+
+async function persistInboundReceivedEvent({
+  from,
+  messageText,
+  sessionKey,
+  routingContext,
+  session,
+}) {
+  try {
+    const inboundEvent = await logInboundEvent({
+      phone: from,
+      projectId: routingContext?.project?.id || null,
+      eventType: 'message_received',
+      status: 'received',
+      metadata: {
+        sessionKey,
+        to: routingContext?.to || null,
+        messageText: String(messageText || ''),
+        currentStep: session?.step || null,
+        connectionId: routingContext?.connection?.id || null,
+        connectionIdentifier:
+          routingContext?.connection?.identifier || routingContext?.to || null,
+        tenantSlug: ACTIVE_TENANT_SLUG,
+        botProfileId: routingContext?.botProfile?.id || null,
+        botProfileFallbackUsed: routingContext?.botProfile?.fallbackUsed || false,
+        botProfileSource: routingContext?.botProfile?.source || null,
+      },
+    });
+
+    logFlow('inboundEventSaved', {
+      eventType: 'message_received',
+      inboundEventId: inboundEvent.id,
+      sessionKey,
+      projectId: routingContext?.project?.id || null,
+    });
+
+    return inboundEvent;
+  } catch (error) {
+    console.error('[bot-runtime] inboundEventPersistFailed', {
+      sessionKey,
+      phone: from,
+      projectId: routingContext?.project?.id || null,
+      message: error.message,
+      code: error.code || null,
+    });
+    return null;
+  }
 }
 
 async function resolveProjectServices(routingContext, options = {}) {
@@ -376,6 +520,14 @@ async function submitAppointmentRequest(sessionKey, from, session, routingContex
   const tenantSlug = ACTIVE_TENANT_SLUG;
 
   try {
+    logFlow('serviceRequestCreateStart', {
+      sessionKey,
+      sessionId,
+      projectId: routingContext.project.id,
+      phone: from,
+      service: selectedService,
+    });
+
     console.log('[core] Iniciando persistencia oficial da solicitacao:', {
       phone: from,
       to: routingContext.to,
@@ -404,6 +556,28 @@ async function submitAppointmentRequest(sessionKey, from, session, routingContex
       routingContext,
     });
 
+    logFlow('contactSaved', {
+      sessionKey,
+      contactId: registrationResult.contact.id,
+      projectId: registrationResult.project.id,
+      phone: from,
+      wasCreated: registrationResult.contact.wasCreated === true,
+    });
+    logFlow('serviceRequestCreated', {
+      sessionKey,
+      sessionId,
+      serviceRequestId: registrationResult.serviceRequest.id,
+      projectId: registrationResult.project.id,
+      contactId: registrationResult.contact.id,
+    });
+    logFlow('inboundEventSaved', {
+      eventType: 'service_request_created',
+      inboundEventId: registrationResult.inboundEvent.id,
+      sessionKey,
+      projectId: registrationResult.project.id,
+      serviceRequestId: registrationResult.serviceRequest.id,
+    });
+
     console.log(`[bot] serviceRequestCreated=${registrationResult.serviceRequest.id}`);
     console.log('[core] Persistencia oficial concluida:', {
       projectId: registrationResult.project.id,
@@ -421,7 +595,7 @@ async function submitAppointmentRequest(sessionKey, from, session, routingContex
     const successMessage = getRequestRegisteredMessage(routingContext.botProfile, session);
     await persistSessionState(sessionKey, { status: 'service_request_created' });
     closeSession(sessionKey, buildSessionContext(from, routingContext));
-    await persistSessionState(sessionKey);
+    await persistSessionState(sessionKey, { status: 'completed' });
 
     return successMessage;
   } catch (error) {
@@ -467,6 +641,10 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
       projectId: routingContext?.project?.id || null,
       tenantSlug: ACTIVE_TENANT_SLUG,
     });
+    logEarlyReturn('services_unavailable', {
+      sessionKey,
+      projectId: routingContext?.project?.id || null,
+    });
     return getServiceUnavailableMessage(routingContext.botProfile);
   }
 
@@ -476,6 +654,11 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
       step: session.step,
       projectId: routingContext?.project?.id || null,
       tenantSlug: ACTIVE_TENANT_SLUG,
+    });
+    logEarlyReturn('missing_selected_service', {
+      sessionKey,
+      currentStep: session.step,
+      projectId: routingContext?.project?.id || null,
     });
     return await startScheduling(sessionKey, buildSessionContext(from, routingContext), routingContext);
   }
@@ -492,6 +675,12 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
         tenantSlug: ACTIVE_TENANT_SLUG,
         input: cleanedMessage,
         code: serviceSelection.code,
+      });
+      logEarlyReturn('invalid_service_selection', {
+        sessionKey,
+        projectId: routingContext?.project?.id || null,
+        code: serviceSelection.code,
+        input: cleanedMessage,
       });
       return getServiceSelectionErrorMessage(serviceCatalog.services);
     }
@@ -517,6 +706,10 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
     const nameResult = normalizeNameInput(cleanedMessage);
 
     if (!nameResult.isValid) {
+      logEarlyReturn('invalid_name', {
+        sessionKey,
+        input: cleanedMessage,
+      });
       return getNameValidationMessage();
     }
 
@@ -530,6 +723,10 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
     const dateResult = normalizeDateInput(cleanedMessage);
 
     if (!dateResult.isValid) {
+      logEarlyReturn('invalid_date', {
+        sessionKey,
+        input: cleanedMessage,
+      });
       return getDateValidationMessage();
     }
 
@@ -543,6 +740,10 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
     const timeResult = normalizeTimeInput(cleanedMessage);
 
     if (!timeResult.isValid) {
+      logEarlyReturn('invalid_time', {
+        sessionKey,
+        input: cleanedMessage,
+      });
       return getTimeValidationMessage();
     }
 
@@ -558,6 +759,10 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
     }
 
     if (['2', 'corrigir', 'editar', 'nao', 'não'].includes(normalizedMessage)) {
+      logEarlyReturn('restart_requested', {
+        sessionKey,
+        currentStep: session.step,
+      });
       return await restartScheduling(
         sessionKey,
         buildSessionContext(from, routingContext),
@@ -565,6 +770,10 @@ async function handleSchedulingFlow(sessionKey, from, routingContext, messageTex
       );
     }
 
+    logEarlyReturn('invalid_confirmation_choice', {
+      sessionKey,
+      input: normalizedMessage,
+    });
     return getConfirmationChoiceErrorMessage();
   }
 
@@ -595,12 +804,20 @@ async function montarRespostaBot({ sessionKey, from, routingContext, mensagemTex
   if (isMenuCommand(textoNormalizado)) {
     resetSession(sessionKey, buildSessionContext(from, routingContext));
     await persistSessionState(sessionKey, { lastInboundText: mensagemTexto });
+    logEarlyReturn('menu_command', {
+      sessionKey,
+      projectId: routingContext?.project?.id || null,
+    });
     return getWelcomeMenuMessage(botProfile);
   }
 
   if (isGreeting(textoNormalizado) && (!currentSession || currentSession.step === SESSION_STEPS.MENU)) {
     resetSession(sessionKey, buildSessionContext(from, routingContext));
     await persistSessionState(sessionKey, { lastInboundText: mensagemTexto });
+    logEarlyReturn('greeting_menu', {
+      sessionKey,
+      projectId: routingContext?.project?.id || null,
+    });
     return getWelcomeMenuMessage(botProfile);
   }
 
@@ -615,19 +832,36 @@ async function montarRespostaBot({ sessionKey, from, routingContext, mensagemTex
   }
 
   if (selectedMenuKey === 'hours') {
+    logEarlyReturn('hours_info', {
+      sessionKey,
+      projectId: routingContext?.project?.id || null,
+    });
     return getHoursMessage(botProfile);
   }
 
   if (selectedMenuKey === 'address') {
+    logEarlyReturn('address_info', {
+      sessionKey,
+      projectId: routingContext?.project?.id || null,
+    });
     return getAddressMessage(botProfile);
   }
 
   if (selectedMenuKey === 'human') {
     resetSession(sessionKey, buildSessionContext(from, routingContext));
     await persistSessionState(sessionKey, { lastInboundText: mensagemTexto });
+    logEarlyReturn('human_handoff', {
+      sessionKey,
+      projectId: routingContext?.project?.id || null,
+    });
     return getTalkToTeamMessage(botProfile);
   }
 
+  logEarlyReturn('conversation_fallback', {
+    sessionKey,
+    projectId: routingContext?.project?.id || null,
+    messageText: mensagemTexto,
+  });
   return getConversationFallbackMessage(botProfile);
 }
 
@@ -907,6 +1141,28 @@ async function handler(req, res) {
     botProfileId: routingContext.botProfile?.id || null,
     botProfileFallbackUsed: routingContext.botProfile?.fallbackUsed || false,
   });
+
+  const loadedSession = await loadSessionState(
+    sessionKey,
+    buildSessionContext(from, routingContext),
+  );
+  logFlow('inboundReceived', {
+    sessionKey,
+    from,
+    to: routingContext.to,
+    projectId: routingContext.project.id,
+    currentStep: loadedSession?.step || null,
+    messageText: mensagemRecebida,
+  });
+  await persistInboundReceivedEvent({
+    from,
+    messageText: mensagemRecebida,
+    sessionKey,
+    routingContext,
+    session: loadedSession,
+  });
+  await persistSessionState(sessionKey, { lastInboundText: mensagemRecebida });
+
   logCurrentSession(sessionKey);
 
   // TwiML e o XML que a Twilio entende como instrucao de resposta.
@@ -937,13 +1193,16 @@ module.exports.__internals = {
   buildSessionContext,
   buildSessionKey,
   clearSessions,
+  closeSession,
   createInitialSession,
   ensureSession,
   getSelectedServiceFromSession,
   handleSchedulingFlow,
   isSchedulingStep,
+  loadSessionState,
   montarRespostaBot,
   normalizeMessage,
+  persistInboundReceivedEvent,
   resetSession,
   resolveProjectServices,
   sessions,
